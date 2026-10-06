@@ -1,0 +1,28 @@
+#!/bin/bash
+# Toggle the Mac between "my laptop" and "always-on iOS build/Simulator server" for macsim.
+#   macserver on      keep awake even with the lid closed (plug in the charger!)
+#   macserver off     normal sleep behaviour
+#   macserver status  sleep state, proxy, simulators, disk
+#   macserver restart restart the agent-device proxy
+set -u
+LABEL=com.macsim.proxy
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+dom="gui/$(id -u)"
+
+proxy_up() { launchctl print "$dom/$LABEL" >/dev/null 2>&1 || launchctl bootstrap "$dom" "$PLIST"; }
+
+case "${1:-status}" in
+  on)
+    sudo pmset -a disablesleep 1 && echo "sleep disabled — Mac stays reachable with the lid closed"
+    proxy_up; echo "proxy running" ;;
+  off)
+    sudo pmset -a disablesleep 0 && echo "sleep enabled again" ;;
+  restart)
+    launchctl kickstart -k "$dom/$LABEL" && echo "proxy restarted" ;;
+  status)
+    echo "sleep disabled: $(pmset -g | awk '/SleepDisabled/{v=$2} END{print v+0}')"
+    if launchctl print "$dom/$LABEL" 2>/dev/null | grep -q 'state = running'; then echo "proxy: running"; else echo "proxy: NOT running (see ~/.macsim/logs/proxy.log)"; fi
+    echo "booted simulators: $(xcrun simctl list devices booted 2>/dev/null | grep -c Booted)"
+    echo "disk free: $(df -h "$HOME" | awk 'NR==2{print $4}')   ~/builds: $(du -sh "$HOME/builds" 2>/dev/null | cut -f1)" ;;
+  *) echo "usage: macserver on|off|status|restart" >&2; exit 1 ;;
+esac

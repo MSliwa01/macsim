@@ -1,0 +1,10 @@
+#!/bin/bash
+# From the Mac: jump into a persistent tmux session on the client machine (agents keep
+# running when you disconnect). `pc <cmd>` runs a one-off command instead.
+# Uses the `Host pc` entry that `macsim bootstrap` adds to ~/.ssh/config.
+session="${MACSIM_PC_SESSION:-main}"
+if [ $# -eq 0 ]; then
+  exec ssh -t pc "tmux new -A -s '$session'"
+else
+  exec ssh pc "$@"
+fi

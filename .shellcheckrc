@@ -1,0 +1,4 @@
+# Commands sent over SSH are built on the client on purpose (values are quoted with printf %q).
+disable=SC2029
+# `ls` on fixed, tool-generated names (lockfiles, .app bundles) is fine here.
+disable=SC2012

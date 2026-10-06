@@ -1,0 +1,424 @@
+#!/bin/bash
+# Mac-side half of macsim. Invoked over SSH by `macsim` on the client machine.
+# Must stay compatible with macOS /bin/bash 3.2 (no assoc arrays, no mapfile, no ${x,,}).
+set -uo pipefail
+
+MACSIM_HOME="$HOME/.macsim"
+BUILDS="" PROXY_BIND="" PROXY_PORT=4310
+# shellcheck disable=SC1091
+[ -f "$MACSIM_HOME/env.sh" ] && . "$MACSIM_HOME/env.sh"
+# shellcheck disable=SC1091
+[ -f "$MACSIM_HOME/config" ] && . "$MACSIM_HOME/config"
+SIM_GUI="${SIM_GUI:-1}"
+# Per-project working copies. Installs from before BUILDS was configurable used ~/builds.
+if [ -z "$BUILDS" ]; then
+  if ls "$HOME"/builds/*/.last-used >/dev/null 2>&1; then BUILDS="$HOME/builds"; else BUILDS="$MACSIM_HOME/builds"; fi
+fi
+
+die() { echo "macsim(mac): $*" >&2; exit 1; }
+log() { echo "» $*" >&2; }
+
+# ---------- helpers ----------
+
+proj_dir() {
+  [ -n "${1:-}" ] || die "missing project name"
+  case "$1" in */*|..*) die "bad project name: $1" ;; esac
+  echo "$BUILDS/$1"
+}
+
+touch_used() { mkdir -p "$1" && touch "$1/.last-used"; }
+
+# Address the agent-device proxy binds to (PROXY_BIND in ~/.macsim/config):
+#   127.0.0.1 (default)  reachable only through the client's SSH tunnel
+#   tailscale            this Mac's Tailscale IPv4 (100.64.0.0/10)
+#   <ip>                 any explicit local address
+# Configs written before PROXY_BIND existed bound to Tailscale.
+proxy_host() {
+  local b="${PROXY_BIND:-tailscale}"
+  case "$b" in
+    tailscale) ifconfig 2>/dev/null | awk '/inet 100\./{print $2; exit}' ;;
+    *) echo "$b" ;;
+  esac
+}
+
+json_devices() {
+  # Prints: udid<TAB>state<TAB>name<TAB>runtime   (available iPhones, newest runtime first)
+  xcrun simctl list devices available -j | node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+      const j=JSON.parse(d).devices, rows=[];
+      for (const [rt,list] of Object.entries(j)) {
+        const m=rt.match(/iOS-(\d+)-(\d+)/); if(!m) continue;
+        const ver=+m[1]*100+ +m[2];
+        for (const x of list) if (/^iPhone/.test(x.name)) rows.push({ver,rt:"iOS "+m[1]+"."+m[2],...x});
+      }
+      rows.sort((a,b)=>b.ver-a.ver);
+      for (const r of rows) console.log([r.udid,r.state,r.name,r.rt].join("\t"));
+    });'
+}
+
+# resolve_device [name|udid] -> prints udid of a booted simulator
+resolve_device() {
+  local want="${1:-${DEFAULT_DEVICE:-}}" rows udid="" state=""
+  rows="$(json_devices)" || die "simctl failed (is Xcode installed?)"
+  [ -n "$rows" ] || die "no iOS simulators available — install an iOS runtime: xcodebuild -downloadPlatform iOS"
+  if [ -n "$want" ]; then
+    local line
+    line="$(printf '%s\n' "$rows" | awk -F'\t' -v w="$want" '$1==w || $3==w {print; exit}')"
+    [ -n "$line" ] || die "no simulator named '$want'. Available: $(printf '%s\n' "$rows" | cut -f3 | sort -u | tr '\n' ',' )"
+    udid="$(printf '%s' "$line" | cut -f1)"; state="$(printf '%s' "$line" | cut -f2)"
+  else
+    local line
+    line="$(printf '%s\n' "$rows" | awk -F'\t' '$2=="Booted"{print; exit}')"
+    # Prefer a plain "iPhone NN" (lighter than Pro Max) on the newest runtime.
+    [ -n "$line" ] || line="$(printf '%s\n' "$rows" | awk -F'\t' '$3 ~ /^iPhone [0-9]+$/ {print; exit}')"
+    [ -n "$line" ] || line="$(printf '%s\n' "$rows" | head -1)"
+    udid="$(printf '%s' "$line" | cut -f1)"; state="$(printf '%s' "$line" | cut -f2)"
+  fi
+  if [ "$state" != "Booted" ]; then
+    log "booting simulator $udid"
+    xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+    xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+  fi
+  if [ "$SIM_GUI" = "1" ]; then
+    # Xcode 27 replaced Simulator.app with DeviceHub.app.
+    if [ -d "$(xcode-select -p 2>/dev/null)/Applications/Simulator.app" ]; then
+      open -g -a Simulator --args -CurrentDeviceUDID "$udid" >/dev/null 2>&1 || true
+    else
+      open -g -a DeviceHub >/dev/null 2>&1 || true
+    fi
+  fi
+  echo "$udid"
+}
+
+bundle_id_of() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Info.plist" 2>/dev/null; }
+
+summarize_failure() {
+  local logf="$1"
+  echo "---- errors ($logf) ----" >&2
+  grep -E '(error|fatal error):|\*\* BUILD FAILED|❌|CommandError|Error:' "$logf" | grep -v '^[[:space:]]*$' | awk '!seen[$0]++' | head -40 >&2
+  echo "---- last 30 lines ----" >&2
+  tail -30 "$logf" >&2
+}
+
+deps_install() {
+  # Install JS deps in $1 only when the lockfile changed since last install.
+  local dir="$1" lock="" cmd=""
+  [ -f "$dir/package.json" ] || return 0
+  if   [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ]; then lock="$(ls "$dir"/bun.lock* | head -1)"; cmd="bun install"
+  elif [ -f "$dir/pnpm-lock.yaml" ]; then lock="$dir/pnpm-lock.yaml"; cmd="pnpm install --frozen-lockfile"
+  elif [ -f "$dir/yarn.lock" ];      then lock="$dir/yarn.lock";      cmd="yarn install"
+  elif [ -f "$dir/package-lock.json" ]; then lock="$dir/package-lock.json"; cmd="npm ci"
+  else lock="$dir/package.json"; cmd="npm install"; fi
+  local sum; sum="$(cat "$lock" "$dir/package.json" | shasum | cut -d' ' -f1)"
+  if [ -d "$dir/node_modules" ] && [ "$(cat "$dir/.macsim-deps" 2>/dev/null)" = "$sum" ]; then return 0; fi
+  log "installing JS deps ($cmd)"
+  (cd "$dir" && $cmd) >"$LOGDIR/deps.log" 2>&1 || { summarize_failure "$LOGDIR/deps.log"; die "dependency install failed"; }
+  echo "$sum" >"$dir/.macsim-deps"
+}
+
+pods_install() {
+  local iosdir="$1"
+  [ -f "$iosdir/Podfile" ] || return 0
+  command -v pod >/dev/null || die "CocoaPods not installed on Mac (brew install cocoapods)"
+  local sum; sum="$(cat "$iosdir/Podfile" "$iosdir/Podfile.lock" 2>/dev/null | shasum | cut -d' ' -f1)"
+  if [ -d "$iosdir/Pods" ] && [ "$(cat "$iosdir/.macsim-pods" 2>/dev/null)" = "$sum" ]; then return 0; fi
+  log "pod install"
+  (cd "$iosdir" && pod install) >"$LOGDIR/pods.log" 2>&1 || { summarize_failure "$LOGDIR/pods.log"; die "pod install failed"; }
+  sum="$(cat "$iosdir/Podfile" "$iosdir/Podfile.lock" 2>/dev/null | shasum | cut -d' ' -f1)"
+  echo "$sum" >"$iosdir/.macsim-pods"
+}
+
+find_xcode_container() {
+  # prints "-workspace PATH" or "-project PATH"
+  local src="$1" p
+  for p in "$src"/*.xcworkspace "$src"/ios/*.xcworkspace; do
+    [ -d "$p" ] && { echo "-workspace"; echo "$p"; return; }
+  done
+  for p in "$src"/*.xcodeproj "$src"/ios/*.xcodeproj; do
+    [ -d "$p" ] && { echo "-project"; echo "$p"; return; }
+  done
+  return 1
+}
+
+pick_scheme() {
+  local kind="$1" path="$2"
+  xcodebuild -list -json "$kind" "$path" 2>/dev/null | node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+      const j=JSON.parse(d); const c=j.workspace||j.project||{};
+      const base=process.argv[1].replace(/.*\//,"").replace(/\.(xcworkspace|xcodeproj)$/,"");
+      const s=(c.schemes||[]).filter(x=>!/^Pods-|Tests?$|^React|^RCT|^Yoga|^hermes|^Expo|^EX/.test(x));
+      console.log(s.find(x=>x===base)||s[0]||(c.schemes||[])[0]||"");
+    });' "$path"
+}
+
+install_and_launch() {
+  local udid="$1" app="$2" launch="$3" bid
+  bid="$(bundle_id_of "$app")"
+  log "installing $(basename "$app") ($bid)"
+  xcrun simctl install "$udid" "$app" || die "simctl install failed"
+  if [ "$launch" = "1" ]; then
+    xcrun simctl launch --terminate-running-process "$udid" "$bid" >/dev/null || die "launch failed"
+  fi
+  echo "APP=$app"
+  echo "BUNDLE_ID=$bid"
+  echo "UDID=$udid"
+}
+
+# ---------- commands ----------
+
+cmd_build_xcode() {
+  local name="$1"; shift
+  local scheme="" config="Debug" device="" launch=1
+  while [ $# -gt 0 ]; do case "$1" in
+    --scheme) scheme="$2"; shift 2 ;; --configuration) config="$2"; shift 2 ;;
+    --device) device="$2"; shift 2 ;; --no-launch) launch=0; shift ;;
+    *) die "build-xcode: unknown arg $1" ;; esac; done
+  local root; root="$(proj_dir "$name")"; local src="$root/src"
+  [ -d "$src" ] || die "project not synced: $name"
+  LOGDIR="$root/logs"; mkdir -p "$LOGDIR"; touch_used "$root"
+
+  # React Native bare: JS deps + pods first.
+  deps_install "$src"
+  [ -d "$src/ios" ] && pods_install "$src/ios"
+  [ -f "$src/Podfile" ] && pods_install "$src"
+
+  # XcodeGen projects: (re)generate the .xcodeproj from project.yml.
+  local yml
+  for yml in "$src/project.yml" "$src/ios/project.yml"; do
+    [ -f "$yml" ] || continue
+    command -v xcodegen >/dev/null || die "project.yml found but xcodegen missing on Mac (brew install xcodegen)"
+    log "xcodegen generate"
+    (cd "$(dirname "$yml")" && xcodegen generate --use-cache --quiet) >"$LOGDIR/xcodegen.log" 2>&1 \
+      || { summarize_failure "$LOGDIR/xcodegen.log"; die "xcodegen failed"; }
+    # Keep SPM pins from a committed Package.resolved, if the project has one.
+    local pr xp; pr="$(dirname "$yml")/Package.resolved"
+    for xp in "$(dirname "$yml")"/*.xcodeproj; do
+      [ -f "$pr" ] && [ -d "$xp" ] && mkdir -p "$xp/project.xcworkspace/xcshareddata/swiftpm" \
+        && cp "$pr" "$xp/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+    done
+  done
+
+  local c kind path
+  c="$(find_xcode_container "$src")" || die "no .xcworkspace/.xcodeproj found in project (SwiftPM-only packages are not supported yet)"
+  kind="$(echo "$c" | sed -n 1p)"; path="$(echo "$c" | sed -n 2p)"
+  [ -n "$scheme" ] || scheme="$(pick_scheme "$kind" "$path")"
+  [ -n "$scheme" ] || die "could not determine scheme; pass --scheme"
+
+  local udid; udid="$(resolve_device "$device")" || exit 1
+  local logf="$LOGDIR/build.log" t0; t0=$(date +%s)
+  log "xcodebuild $(basename "$path") scheme=$scheme config=$config"
+  if ! xcodebuild "$kind" "$path" -scheme "$scheme" -configuration "$config" \
+        -destination "id=$udid" -derivedDataPath "$root/dd" \
+        COMPILER_INDEX_STORE_ENABLE=NO build >"$logf" 2>&1; then
+    summarize_failure "$logf"; die "BUILD FAILED (full log on Mac: $logf)"
+  fi
+  log "build ok in $(( $(date +%s) - t0 ))s"
+  local app
+  app="$(ls -td "$root/dd/Build/Products/$config-iphonesimulator/"*.app 2>/dev/null | head -1)"
+  [ -n "$app" ] || die "build succeeded but no .app found"
+  install_and_launch "$udid" "$app" "$launch"
+}
+
+cmd_build_expo() {
+  local name="$1"; shift
+  local config="Debug" device="" prebuild=0 launch=1
+  while [ $# -gt 0 ]; do case "$1" in
+    --configuration) config="$2"; shift 2 ;; --device) device="$2"; shift 2 ;;
+    --prebuild) prebuild=1; shift ;; --no-launch) launch=0; shift ;;
+    --scheme) shift 2 ;;
+    *) die "build-expo: unknown arg $1" ;; esac; done
+  local root; root="$(proj_dir "$name")"; local src="$root/src"
+  [ -d "$src" ] || die "project not synced: $name"
+  LOGDIR="$root/logs"; mkdir -p "$LOGDIR"; touch_used "$root"
+  deps_install "$src"
+  if [ "$prebuild" = "1" ] || [ ! -d "$src/ios" ]; then
+    local clean=""; [ "$prebuild" = "1" ] && clean="--clean"
+    log "expo prebuild -p ios $clean"
+    (cd "$src" && CI=1 npx expo prebuild -p ios --no-install $clean) >"$LOGDIR/prebuild.log" 2>&1 \
+      || { summarize_failure "$LOGDIR/prebuild.log"; die "expo prebuild failed"; }
+  fi
+  # Build the generated native project with plain xcodebuild (same path as Swift apps):
+  # no AppleScript/window activation, no Metro on the Mac, DerivedData stays in $BUILDS.
+  local pass=(--configuration "$config"); [ -n "$device" ] && pass+=(--device "$device")
+  [ "$launch" = "1" ] || pass+=(--no-launch)
+  cmd_build_xcode "$name" "${pass[@]}"
+}
+
+cmd_install() {
+  local file="$1"; shift; local device="" launch=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --device) device="$2"; shift 2 ;; --launch) launch=1; shift ;;
+    *) die "install: unknown arg $1" ;; esac; done
+  [ -e "$file" ] || die "no such file on Mac: $file"
+  local app="$file"
+  case "$file" in
+    *.tar.gz|*.tgz)
+      local x="${file%.t*gz}.d"; rm -rf "$x"; mkdir -p "$x"; tar -xzf "$file" -C "$x" || die "extract failed"
+      app="$(find "$x" -maxdepth 3 -name '*.app' -type d | head -1)" ;;
+    *.zip)
+      local x="${file%.zip}.d"; rm -rf "$x"; mkdir -p "$x"; ditto -x -k "$file" "$x" || die "unzip failed"
+      app="$(find "$x" -maxdepth 3 -name '*.app' -type d | head -1)" ;;
+    *.ipa) die ".ipa is a device build; the simulator needs a simulator .app (EAS: \"ios\": {\"simulator\": true})" ;;
+  esac
+  [ -d "$app" ] || die "no .app found in $file"
+  local udid; udid="$(resolve_device "$device")" || exit 1
+  install_and_launch "$udid" "$app" "$launch"
+}
+
+cmd_expo_go() {
+  local url="$1" device="${2:-}" udid
+  udid="$(resolve_device "$device")" || exit 1
+  if xcrun simctl get_app_container "$udid" host.exp.Exponent >/dev/null 2>&1 && [ -z "${FORCE:-}" ]; then
+    echo "Expo Go already installed"; return 0
+  fi
+  local d="$BUILDS/_artifacts/expo-go"; mkdir -p "$d"
+  local f; f="$d/$(basename "$url")"
+  if [ ! -f "$f" ]; then
+    log "downloading $(basename "$url")"
+    curl -fsSL "$url" -o "$f.part" || die "download failed"
+    mv "$f.part" "$f"
+  fi
+  rm -rf "$d/app"; mkdir -p "$d/app"; tar -xzf "$f" -C "$d/app" || die "extract failed"
+  local app; app="$(find "$d/app" -maxdepth 2 -name '*.app' -type d | head -1)"
+  [ -n "$app" ] || app="$d/app"   # some releases tar the bundle contents directly
+  xcrun simctl install "$udid" "$app" || die "Expo Go install failed"
+  echo "Expo Go installed"
+}
+
+cmd_view() {
+  local logf="$MACSIM_HOME/logs/serve-sim.log" port="${VIEW_PORT:-3200}"
+  case "${1:-start}" in
+    start)
+      command -v serve-sim >/dev/null || die "serve-sim not installed — re-run: bash ~/.macsim/setup.sh"
+      if pgrep -f 'serve-sim/dist/serve-sim.js' >/dev/null && curl -fs -m 2 -o /dev/null "http://127.0.0.1:$port/"; then
+        echo "VIEW_PORT=$port"; return 0
+      fi
+      local udid; udid="$(resolve_device "${2:-}")" || exit 1
+      mkdir -p "$MACSIM_HOME/logs"
+      nohup serve-sim --port "$port" "$udid" >"$logf" 2>&1 </dev/null &
+      local _; for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        curl -fs -m 1 -o /dev/null "http://127.0.0.1:$port/" && { echo "VIEW_PORT=$port"; return 0; }
+        sleep 1
+      done
+      tail -20 "$logf" >&2; die "serve-sim did not come up on :$port" ;;
+    stop)
+      serve-sim --kill >/dev/null 2>&1; pkill -f 'serve-sim/dist/serve-sim.js' 2>/dev/null; echo "preview stopped" ;;
+    *) die "view start|stop" ;;
+  esac
+}
+
+cmd_devices() {
+  json_devices | awk -F'\t' '{printf "%-8s %-28s %-10s %s\n",$2,$3,$4,$1}'
+}
+
+cmd_clean() {
+  case "${1:-}" in
+    --stale)
+      local days="${2:-7}" d
+      for d in "$BUILDS"/*/; do
+        d="${d%/}"; [ "$(basename "$d")" = "_artifacts" ] && continue
+        [ -f "$d/.last-used" ] || { echo "skip (no marker): $d"; continue; }
+        if [ -n "$(find "$d/.last-used" -mtime +"$days" 2>/dev/null)" ]; then
+          echo "removing $(basename "$d") ($(du -sh "$d" | cut -f1))"; rm -rf "$d"
+        fi
+      done
+      rm -rf "$BUILDS/_artifacts"/*.d 2>/dev/null ;;
+    --all)
+      echo "removing everything in $BUILDS ($(du -sh "$BUILDS" 2>/dev/null | cut -f1))"
+      rm -rf "${BUILDS:?}"/* ;;
+    --derived)
+      local d; for d in "$BUILDS"/*/dd "$BUILDS"/*/src/ios/build; do [ -d "$d" ] && rm -rf "$d"; done
+      echo "removed DerivedData of all projects" ;;
+    "") die "clean: pass <name> | --stale DAYS | --derived | --all" ;;
+    *) local d; d="$(proj_dir "$1")"; [ -d "$d" ] || die "no such project: $1"
+       echo "removing $1 ($(du -sh "$d" | cut -f1))"; rm -rf "$d" ;;
+  esac
+  xcrun simctl delete unavailable >/dev/null 2>&1 || true
+  echo "free: $(df -h "$HOME" | awk 'NR==2{print $4}')"
+}
+
+cmd_uninstall() {
+  local keep_builds=0; [ "${1:-}" = "--keep-builds" ] && keep_builds=1
+  launchctl bootout "gui/$(id -u)/com.macsim.proxy" >/dev/null 2>&1
+  rm -f "$HOME/Library/LaunchAgents/com.macsim.proxy.plist"
+  command -v serve-sim >/dev/null && serve-sim --kill >/dev/null 2>&1
+  local rc
+  for rc in "$HOME/.zshrc" "$HOME/.bash_profile"; do
+    [ -f "$rc" ] && grep -q '# macsim$' "$rc" && sed -i '' '/# macsim$/d' "$rc"
+  done
+  if [ -f "$HOME/.ssh/config" ] && grep -q '^# added by macsim$' "$HOME/.ssh/config"; then
+    cp "$HOME/.ssh/config" "$HOME/.ssh/config.bak-macsim"
+    awk '/^# added by macsim$/{skip=1; next} skip && /^[[:space:]]*$/{skip=0; next} !skip' \
+      "$HOME/.ssh/config.bak-macsim" >"$HOME/.ssh/config"
+  fi
+  if [ "$keep_builds" = 1 ]; then
+    echo "kept builds: $BUILDS"
+    case "$BUILDS" in "$MACSIM_HOME"/*) mv "$BUILDS" "$HOME/macsim-builds" && echo "moved to ~/macsim-builds" ;; esac
+  else
+    rm -rf "$BUILDS"
+  fi
+  rm -rf "$MACSIM_HOME"
+  echo "macsim removed from this Mac (LaunchAgent, ~/.macsim, shell PATH line, 'Host pc' block)."
+}
+
+cmd_list() {
+  local d
+  for d in "$BUILDS"/*/; do
+    d="${d%/}"; [ -d "$d" ] || continue
+    local used="-"; [ -f "$d/.last-used" ] && used="$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$d/.last-used")"
+    printf '%-40s %6s  last used %s\n' "$(basename "$d")" "$(du -sh "$d" 2>/dev/null | cut -f1)" "$used"
+  done
+}
+
+cmd_doctor() {
+  local ok=1
+  chk() { if eval "$2" >/dev/null 2>&1; then printf '  ok   %s\n' "$1"; else printf '  FAIL %s  -> %s\n' "$1" "$3"; ok=0; fi; }
+  echo "Mac: $(scutil --get ComputerName 2>/dev/null) — macOS $(sw_vers -productVersion) — $(sysctl -n hw.memsize | awk '{printf "%.0f GB RAM", $1/1073741824}')"
+  chk "Xcode selected"        'xcode-select -p | grep -q Xcode' 'install Xcode, then: sudo xcode-select -s /Applications/Xcode.app'
+  chk "xcodebuild works"      'xcodebuild -version'             'sudo xcodebuild -license accept && xcodebuild -runFirstLaunch'
+  chk "iOS runtime present"   'xcrun simctl list runtimes | grep -q "iOS"' 'xcodebuild -downloadPlatform iOS'
+  chk "node"                  'command -v node'                 're-run setup.sh (needs node)'
+  chk "agent-device"          'command -v agent-device'         're-run setup.sh'
+  chk "serve-sim (preview)"   'command -v serve-sim'            're-run setup.sh'
+  chk "cocoapods (RN/Expo)"   'command -v pod'                  'brew install cocoapods'
+  chk "proxy LaunchAgent"     "launchctl print gui/$(id -u)/com.macsim.proxy" 'bash ~/.macsim/setup.sh'
+  chk "token present"         "test -s $MACSIM_HOME/token"      'run macsim bootstrap from the client'
+  local ip; ip="$(proxy_host)"
+  chk "proxy bind address (${PROXY_BIND:-tailscale}: ${ip:-none})" "test -n '$ip'" 'start Tailscale, or set PROXY_BIND in ~/.macsim/config'
+  chk "proxy /health"         "curl -fsS -m 3 http://$ip:$PROXY_PORT/health" "see ~/.macsim/logs/proxy.log"
+  xcodebuild -version 2>/dev/null | head -1 | sed 's/^/  /'
+  echo "  agent-device $(agent-device --version 2>/dev/null || echo '?')"
+  echo "  disk free: $(df -h "$HOME" | awk 'NR==2{print $4}')   builds ($BUILDS): $(du -sh "$BUILDS" 2>/dev/null | cut -f1)"
+  echo "  sleep disabled: $(pmset -g 2>/dev/null | awk '/SleepDisabled/{v=$2} END{print v+0}')"
+  echo "  booted: $(xcrun simctl list devices booted 2>/dev/null | grep -c Booted) simulator(s)"
+  [ "$ok" = 1 ]
+}
+
+main() {
+  local c="${1:-}"; [ $# -gt 0 ] && shift
+  case "$c" in
+    build-xcode) cmd_build_xcode "$@" ;;
+    build-expo)  cmd_build_expo "$@" ;;
+    install)     cmd_install "$@" ;;
+    expo-go)     cmd_expo_go "$@" ;;
+    boot)        resolve_device "${1:-}" ;;
+    devices)     cmd_devices ;;
+    view)        cmd_view "$@" ;;
+    launch)      local u; u="$(resolve_device "${2:-}")" && xcrun simctl launch --terminate-running-process "$u" "$1" ;;
+    terminate)   xcrun simctl terminate booted "$1" ;;
+    openurl)     local u; u="$(resolve_device "${2:-}")" && xcrun simctl openurl "$u" "$1" ;;
+    screenshot)  xcrun simctl io booted screenshot --type=png "$1" >/dev/null && echo "$1" ;;
+    shutdown)    xcrun simctl shutdown all; osascript -e 'quit app "Simulator"' -e 'quit app "DeviceHub"' >/dev/null 2>&1; echo "all simulators shut down" ;;
+    clean)       cmd_clean "$@" ;;
+    list)        cmd_list ;;
+    touch)       touch_used "$(proj_dir "$1")" ;;
+    doctor)      cmd_doctor ;;
+    prepare)     local d; d="$(proj_dir "${1:-}")"; mkdir -p "$d/src" && touch "$d/.last-used" && echo "$d/src" ;;
+    artifacts-dir) mkdir -p "$BUILDS/_artifacts" && echo "$BUILDS/_artifacts" ;;
+    proxy-host)  proxy_host ;;
+    agent-device-version) agent-device --version ;;
+    uninstall)   cmd_uninstall "$@" ;;
+    *) die "unknown command: $c" ;;
+  esac
+}
+main "$@"

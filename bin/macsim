@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# macsim: use a Mac as a remote iOS build + Simulator server from a Linux (or WSL) machine.
+# Code and agents stay on the client; the Mac keeps a synced working copy per project.
+# https://github.com/MSliwa01/macsim  (MIT)
+set -uo pipefail
+
+resolve_self() {
+  local p="${BASH_SOURCE[0]}"
+  readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null || echo "$p"
+}
+SELF="$(resolve_self)"
+REPO="$(dirname "$(dirname "$SELF")")"
+VERSION="$(cat "$REPO/VERSION" 2>/dev/null || echo dev)"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/macsim"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/macsim"
+mkdir -p "$CACHE_DIR"
+
+MAC_SSH=macsim-mac MAC_HOST="" MAC_USER="" PROXY_PORT=4310 PROXY_MODE="" DEVICE="" METRO_PORT=8081
+# shellcheck disable=SC1091
+[ -f "$CONF_DIR/config" ] && . "$CONF_DIR/config"
+# Configs written before PROXY_MODE existed talked to the proxy directly over Tailscale.
+PROXY_MODE="${PROXY_MODE:-direct}"
+# One Metro port per invocation: --metro-port N  >  $MACSIM_METRO_PORT  >  config (default 8081)
+METRO_PORT="${MACSIM_METRO_PORT:-${METRO_PORT%% *}}"
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6)
+die()  { echo "macsim: $*" >&2; exit 1; }
+info() { echo "» $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+macsim: remote iOS builds + Simulator on a Mac, driven from this machine
+
+Setup
+  macsim bootstrap USER@HOST [opts]   first-time setup of this machine + the Mac (interactive)
+      --alias NAME         SSH alias to create (default: macsim-mac)
+      --direct             reach the Mac's proxy over Tailscale instead of an SSH tunnel
+      --pc-access          let the Mac SSH back into this machine (`pc` command on the Mac)
+  macsim status                       is the Mac up? Xcode, proxy, disk, simulators
+  macsim uninstall [--keep-builds]    remove macsim from the Mac and from this machine
+  macsim --version
+
+Build & run (inside the project dir, or pass PATH)
+  macsim build [PATH] [opts]          sync + build + install + launch on the simulator
+      --device NAME|UDID  --scheme S  --configuration Debug|Release
+      --type expo|rn|xcode   --prebuild (Expo: regenerate ios/)   --no-launch
+  macsim sync [PATH] [--dry-run]      only rsync the project to the Mac
+  macsim install FILE [--launch]      install a simulator .app / .tar.gz / .zip (e.g. an EAS build)
+  macsim launch BUNDLE_ID             (re)launch an installed app
+  macsim open-url URL                 open a deep link in the simulator
+  macsim screenshot [OUT.png]         screenshot copied to this machine
+  macsim devices                      list available iPhone simulators
+  macsim boot [NAME]                  boot a simulator (prints its UDID)
+  macsim shutdown                     shut down all simulators (frees Mac RAM)
+  macsim view [stop]                  live simulator in your browser (serve-sim over SSH)
+
+React Native / Expo (Metro runs on this machine)
+  macsim tunnel start|stop|status     make the Mac's 127.0.0.1:PORT reach Metro here
+  macsim dev-client [PATH]            point an installed expo-dev-client build at Metro
+  macsim expo-go [PATH]               install the matching Expo Go and open the project (experimental)
+      --metro-port N works with build/tunnel/dev-client/expo-go when Metro isn't on 8081
+
+UI automation for agents
+  ios-device <agent-device args>      agent-device connected to the Mac's simulator
+
+Housekeeping
+  macsim list                         projects cached on the Mac (size, last use)
+  macsim clean NAME|--stale DAYS|--derived|--all
+  macsim ssh [CMD...]                 shell on the Mac (macsim env loaded)
+  macsim push                         update Mac-side scripts (automatic on change)
+EOF
+}
+
+# ---------- portability ----------
+
+sha1() { if command -v sha1sum >/dev/null; then sha1sum; else shasum -a 1; fi | cut -c1-40; }
+open_browser() {
+  local u="$1" c
+  for c in xdg-open wslview open; do command -v "$c" >/dev/null && { "$c" "$u" >/dev/null 2>&1 & return; }; done
+}
+pid_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+# ---------- remote plumbing ----------
+
+q() { local out="" a; for a in "$@"; do out+=" $(printf '%q' "$a")"; done; echo "${out# }"; }
+
+scripts_hash() { (cd "$REPO/mac" && cat setup.sh bin/*) | sha1 | cut -c1-12; }
+
+push_scripts() {
+  info "updating Mac-side scripts"
+  rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/mac/" "$MAC_SSH:.macsim/" || offline
+  ssh "${SSH_OPTS[@]}" "$MAC_SSH" "chmod +x ~/.macsim/bin/* ~/.macsim/setup.sh; echo $(scripts_hash) > ~/.macsim/.hash" || offline
+}
+
+offline() {
+  echo "macsim: the Mac ('$MAC_SSH', ${MAC_USER:-?}@${MAC_HOST:-?}) is unreachable over SSH." >&2
+  echo "        Is it asleep, is the lid closed, or is the network/VPN (e.g. Tailscale) down?" >&2
+  echo "        A logged-in GUI session is required. On the Mac, 'macserver on' keeps it awake." >&2
+  exit 3
+}
+
+# r CMD ARGS... : run macsim-remote on the Mac; auto-pushes scripts when they changed.
+r() {
+  local h rc; h="$(scripts_hash)"
+  local cmd
+  cmd="[ \"\$(cat ~/.macsim/.hash 2>/dev/null)\" = $h ] || exit 99; [ -f ~/.macsim/env.sh ] && . ~/.macsim/env.sh; ~/.macsim/bin/macsim-remote $(q "$@")"
+  ssh "${SSH_OPTS[@]}" "$MAC_SSH" "$cmd"; rc=$?
+  if [ $rc -eq 99 ]; then push_scripts; ssh "${SSH_OPTS[@]}" "$MAC_SSH" "$cmd"; rc=$?; fi
+  [ $rc -eq 255 ] && offline
+  return $rc
+}
+
+need_config() { [ -f "$CONF_DIR/config" ] || die "not configured yet. Run: macsim bootstrap <mac-user>@<mac-host>"; }
+
+# ---------- agent-device proxy access ----------
+
+PROXY_PID="$CACHE_DIR/proxy-tunnel.pid"
+
+# Prints the proxy base URL, starting the SSH tunnel first in ssh mode.
+proxy_url() {
+  if [ "$PROXY_MODE" = direct ]; then echo "http://$MAC_HOST:$PROXY_PORT"; return; fi
+  local url="http://127.0.0.1:$PROXY_PORT"
+  if ! curl -fs -m 2 -o /dev/null "$url/health"; then
+    pid_alive "$PROXY_PID" && kill "$(cat "$PROXY_PID")" 2>/dev/null
+    nohup ssh "${SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+      -L "127.0.0.1:$PROXY_PORT:127.0.0.1:$PROXY_PORT" "$MAC_SSH" >"$CACHE_DIR/proxy-tunnel.log" 2>&1 &
+    echo $! >"$PROXY_PID"
+    local _; for _ in 1 2 3 4 5 6 7 8 9 10; do curl -fs -m 1 -o /dev/null "$url/health" && break; sleep 0.5; done
+    pid_alive "$PROXY_PID" || { cat "$CACHE_DIR/proxy-tunnel.log" >&2; die "could not open the SSH tunnel to the proxy (local port $PROXY_PORT busy?)"; }
+    curl -fs -m 2 -o /dev/null "$url/health" \
+      || die "the proxy is not answering on the Mac yet (it can take ~15 s after setup or a restart); see ~/.macsim/logs/proxy.log there"
+  fi
+  echo "$url"
+}
+
+# ---------- project helpers ----------
+
+proj_root() { local p="${1:-.}"; [ -d "$p" ] || die "no such directory: $p"; (cd "$p" && pwd -P); }
+proj_name() { local root="$1"; echo "$(basename "$root" | sed 's/[^A-Za-z0-9._-]/_/g')-$(printf '%s' "$root" | sha1 | cut -c1-6)"; }
+
+has_dep() { node -e 'const p=require(process.argv[1]);const d={...p.dependencies,...p.devDependencies};process.exit(d[process.argv[2]]?0:1)' "$1/package.json" "$2" 2>/dev/null; }
+
+proj_type() {
+  local root="$1"
+  if [ -f "$root/package.json" ]; then
+    has_dep "$root" expo && { echo expo; return; }
+    has_dep "$root" react-native && { echo rn; return; }
+  fi
+  if [ -f "$root/project.yml" ] || [ -f "$root/ios/project.yml" ]; then echo xcode; return; fi
+  if compgen -G "$root/*.xcodeproj" >/dev/null || compgen -G "$root/*.xcworkspace" >/dev/null || compgen -G "$root/ios/*.xcodeproj" >/dev/null; then echo xcode; return; fi
+  [ -f "$root/Package.swift" ] && die "SwiftPM-only package: add an Xcode app project to build for the simulator"
+  die "can't tell what this project is (no package.json with expo/react-native, no .xcodeproj, no project.yml)"
+}
+
+cmd_sync() {
+  local path="" dry=()
+  while [ $# -gt 0 ]; do case "$1" in --dry-run|-n) dry=(-n -i); shift ;; *) path="$1"; shift ;; esac; done
+  local root name; root="$(proj_root "$path")"; name="$(proj_name "$root")"
+  local ex=(--exclude=.git/ --exclude=node_modules/ --exclude=.expo/ --exclude=/android/
+            --exclude=/build/ --exclude=/ios/build/ --exclude=/ios/Pods/ --exclude=/Pods/
+            --exclude=DerivedData/ --exclude=.DS_Store --exclude=xcuserdata/
+            --exclude=.macsim-deps --exclude=.macsim-pods --exclude=.venv/ --exclude=.gradle/)
+  # CNG Expo projects: ios/ only exists on the Mac (generated), so don't let --delete wipe it.
+  [ -d "$root/ios" ] || ex+=(--exclude=/ios/)
+  # XcodeGen: the .xcodeproj is generated on the Mac; protect it from --delete.
+  if [ -f "$root/project.yml" ] && ! compgen -G "$root/*.xcodeproj" >/dev/null; then ex+=(--exclude='/*.xcodeproj/'); fi
+  if [ -f "$root/ios/project.yml" ] && ! compgen -G "$root/ios/*.xcodeproj" >/dev/null; then ex+=(--exclude='/ios/*.xcodeproj/'); fi
+  # Respect .gitignore files at any depth: keeps build junk, caches and artifacts off the Mac.
+  [ -f "$root/.gitignore" ] && ex+=(--filter=':- .gitignore')
+  [ -f "$root/.macsimignore" ] && ex+=(--exclude-from="$root/.macsimignore")
+  local dest; dest="$(r prepare "$name")" || exit 1
+  [ ${#dry[@]} -eq 0 ] && info "sync $root -> mac:$dest"
+  # shellcheck disable=SC2016  # $PATH must expand on the Mac
+  rsync -az --delete "${dry[@]}" "${ex[@]}" \
+    --rsync-path='PATH=/opt/homebrew/bin:/usr/local/bin:$PATH rsync' \
+    -e "ssh ${SSH_OPTS[*]}" "$root/" "$MAC_SSH:$dest/" || die "rsync failed"
+  echo "$name"
+}
+
+metro_running() { curl -fsS -m 2 "http://localhost:$METRO_PORT/status" 2>/dev/null | grep -q running; }
+
+with_lock() { # with_lock NAME: serialize builds of one project (best effort without flock)
+  command -v flock >/dev/null || return 0
+  exec 9>"$CACHE_DIR/$1.lock"
+  flock -n 9 || { info "another build of this project is running, waiting"; flock 9; }
+}
+
+cmd_build() {
+  local path="" type="" pass=() launch=1 has_device=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --type) type="$2"; shift 2 ;;
+    --device) pass+=("$1" "$2"); has_device=1; shift 2 ;;
+    --scheme|--configuration) pass+=("$1" "$2"); shift 2 ;;
+    --prebuild) pass+=("$1"); shift ;;
+    --no-launch) pass+=("$1"); launch=0; shift ;;
+    -*) die "unknown option $1" ;;
+    *) path="$1"; shift ;; esac; done
+  [ -n "$DEVICE" ] && [ $has_device = 0 ] && pass+=(--device "$DEVICE")
+  local root name; root="$(proj_root "$path")"; name="$(proj_name "$root")"
+  [ -n "$type" ] || type="$(proj_type "$root")" || exit 1
+  with_lock "$name"
+
+  if [ "$type" != xcode ]; then
+    if metro_running; then tunnel_start >/dev/null
+    else info "Metro is not running on port $METRO_PORT here. Start it (e.g. 'npx expo start'), then 'macsim tunnel start'."; fi
+  fi
+  cmd_sync "$root" >/dev/null || exit 1
+  local out rc
+  case "$type" in
+    expo)  out="$(r build-expo "$name" "${pass[@]}")"; rc=$? ;;
+    rn|xcode) out="$(r build-xcode "$name" "${pass[@]}")"; rc=$? ;;
+    *) die "unknown --type $type" ;;
+  esac
+  [ $rc -eq 0 ] || exit $rc
+  echo "$out"
+  local bid; bid="$(sed -n 's/^BUNDLE_ID=//p' <<<"$out")"
+  if [ "$type" = expo ] && [ $launch = 1 ] && has_dep "$root" expo-dev-client; then
+    cmd_dev_client "$root" >/dev/null && info "dev client pointed at Metro on this machine"
+  fi
+  echo "PROJECT=$name"
+  [ -n "$bid" ] && echo "next: ios-device open $bid --platform ios   (UI automation)"
+}
+
+expo_cfg() { # prints the Expo public config as JSON
+  (cd "$1" && npx --no-install expo config --type public --json 2>/dev/null) \
+    || node -e 'const j=require(process.argv[1]);console.log(JSON.stringify(j.expo||j))' "$1/app.json" 2>/dev/null
+}
+
+cmd_dev_client() {
+  local root; root="$(proj_root "${1:-}")"
+  local slug; slug="$(expo_cfg "$root" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).slug||""))')"
+  [ -n "$slug" ] || die "could not read the Expo slug"
+  tunnel_start >/dev/null
+  r openurl "exp+$slug://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A$METRO_PORT" ${DEVICE:+"$DEVICE"}
+}
+
+cmd_expo_go() {
+  local root; root="$(proj_root "${1:-}")"
+  local ver; ver="$(node -e 'try{console.log(require(require.resolve("expo/package.json",{paths:[process.argv[1]]})).version.split(".")[0])}catch{const p=require(process.argv[1]+"/package.json");console.log(((p.dependencies||{}).expo||"").replace(/[^0-9.]/g,"").split(".")[0])}' "$root")"
+  [ -n "$ver" ] || die "can't determine the Expo SDK version"
+  local url; url="$(curl -fsSL https://api.expo.dev/v2/versions/latest | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const s=JSON.parse(d).data.sdkVersions[process.argv[1]+".0.0"];console.log(s&&s.iosClientUrl||"")})' "$ver")"
+  [ -n "$url" ] || die "no Expo Go simulator build for SDK $ver"
+  r expo-go "$url" "$DEVICE" || exit 1
+  metro_running || info "Metro is not running here. Start 'npx expo start' first."
+  tunnel_start >/dev/null
+  r openurl "exp://127.0.0.1:$METRO_PORT" ${DEVICE:+"$DEVICE"}
+}
+
+# ---------- Metro reverse tunnel ----------
+
+tun_pid() { echo "$CACHE_DIR/tunnel.$METRO_PORT.pid"; }
+
+tunnel_start() {
+  if pid_alive "$(tun_pid)"; then echo "tunnel already running (pid $(cat "$(tun_pid)"))"; return 0; fi
+  nohup ssh "${SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -R "127.0.0.1:$METRO_PORT:localhost:$METRO_PORT" "$MAC_SSH" >"$CACHE_DIR/tunnel.log" 2>&1 &
+  echo $! >"$(tun_pid)"
+  sleep 1.5
+  if pid_alive "$(tun_pid)"; then echo "tunnel up: Mac 127.0.0.1:$METRO_PORT -> localhost:$METRO_PORT here"
+  else
+    rm -f "$(tun_pid)"
+    grep -q "remote port forwarding failed" "$CACHE_DIR/tunnel.log" \
+      && die "port $METRO_PORT is already taken on the Mac (Metro running there?)"
+    offline
+  fi
+}
+tunnel_stop() {
+  if pid_alive "$(tun_pid)"; then kill "$(cat "$(tun_pid)")"; echo "tunnel stopped"; else echo "tunnel not running"; fi
+  rm -f "$(tun_pid)"
+}
+
+# ---------- live preview (serve-sim on the Mac, forwarded to localhost here) ----------
+
+VIEW_PID="$CACHE_DIR/view.pid"
+
+cmd_view() {
+  local port=3200
+  case "${1:-start}" in
+    stop)
+      pid_alive "$VIEW_PID" && kill "$(cat "$VIEW_PID")"; rm -f "$VIEW_PID"
+      r view stop ;;
+    start)
+      local out; out="$(r view start ${DEVICE:+"$DEVICE"})" || exit 1
+      port="$(sed -n 's/^VIEW_PORT=//p' <<<"$out")"
+      if ! pid_alive "$VIEW_PID"; then
+        nohup ssh "${SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
+          -o ServerAliveInterval=15 -L "127.0.0.1:$port:127.0.0.1:$port" "$MAC_SSH" >"$CACHE_DIR/view.log" 2>&1 &
+        echo $! >"$VIEW_PID"; sleep 1.5
+        pid_alive "$VIEW_PID" || { rm -f "$VIEW_PID"; cat "$CACHE_DIR/view.log" >&2; die "could not forward port $port (busy here?)"; }
+      fi
+      echo "preview: http://localhost:$port"
+      [ -n "${MACSIM_NO_BROWSER:-}" ] || open_browser "http://localhost:$port" ;;
+    *) die "view [start|stop]" ;;
+  esac
+}
+
+# ---------- misc commands ----------
+
+cmd_install() {
+  local file="${1:-}"; shift || true
+  [ -e "$file" ] || die "usage: macsim install FILE [--launch]"
+  local dir; dir="$(r artifacts-dir)" || exit 1
+  rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "$file" "$MAC_SSH:$dir/" || die "upload failed"
+  r install "$dir/$(basename "$file")" ${DEVICE:+--device "$DEVICE"} "$@"
+}
+
+cmd_screenshot() {
+  local out="${1:-$PWD/sim-$(date +%H%M%S).png}" tmp="/tmp/macsim-shot-$$.png"
+  r screenshot "$tmp" >/dev/null || exit 1
+  scp -q "${SSH_OPTS[@]}" "$MAC_SSH:$tmp" "$out" && ssh "${SSH_OPTS[@]}" "$MAC_SSH" "rm -f $tmp"
+  echo "$out"
+}
+
+cmd_status() {
+  need_config
+  echo "macsim $VERSION   Mac: $MAC_SSH ($MAC_USER@$MAC_HOST)   proxy mode: $PROXY_MODE"
+  ssh "${SSH_OPTS[@]}" "$MAC_SSH" true 2>/dev/null || offline
+  r doctor; local rc=$?
+  local url; url="$(proxy_url 2>/dev/null)"
+  if [ -n "$url" ] && curl -fs -m 3 -o /dev/null "$url/health"; then echo "  ok   proxy reachable from here ($url)"
+  else echo "  FAIL proxy not reachable from here${url:+ ($url)}; see ~/.macsim/logs/proxy.log on the Mac"; rc=1; fi
+  local mine theirs; mine="$(agent-device --version 2>/dev/null)"; theirs="$(r agent-device-version 2>/dev/null)"
+  if [ -z "$mine" ]; then echo "  FAIL agent-device not installed here (npm i -g agent-device@${theirs:-latest}); ios-device needs it"; rc=1
+  elif [ -n "$theirs" ] && [ "$mine" != "$theirs" ]; then echo "  WARN agent-device $mine here vs $theirs on the Mac: re-run 'bash ~/.macsim/setup.sh --agent-device-version $mine' on the Mac"
+  fi
+  local t up=""; for t in "$CACHE_DIR"/tunnel.*.pid; do pid_alive "$t" && up+=" :$(basename "$t" | cut -d. -f2)"; done
+  echo "  metro tunnels:${up:- none}"
+  return $rc
+}
+
+ssh_pubkey() { # prints a public key path, creating an ed25519 key if there is none
+  local k
+  for k in ~/.ssh/id_ed25519.pub ~/.ssh/id_ecdsa.pub ~/.ssh/id_rsa.pub; do [ -f "$k" ] && { echo "$k"; return; }; done
+  info "no SSH key found, creating ~/.ssh/id_ed25519"
+  ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 >/dev/null || die "ssh-keygen failed"
+  echo ~/.ssh/id_ed25519.pub
+}
+
+client_addr() { # address the Mac can use to reach this machine
+  local a
+  a="$(tailscale ip -4 2>/dev/null | head -1)"
+  [ -n "$a" ] || a="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  echo "${a:-$(hostname)}"
+}
+
+cmd_bootstrap() {
+  local target="" alias_="$MAC_SSH" mode="ssh" pc_access=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --alias) alias_="$2"; shift 2 ;;
+    --direct|--tailscale) mode=direct; shift ;;
+    --pc-access) pc_access=1; shift ;;
+    -*) die "unknown option $1" ;;
+    *) target="$1"; shift ;; esac; done
+  [[ "$target" == *@* ]] || die "usage: macsim bootstrap <mac-user>@<mac-host> [--alias NAME] [--direct] [--pc-access]"
+  for c in ssh rsync curl node; do command -v "$c" >/dev/null || die "'$c' is required on this machine"; done
+  command -v agent-device >/dev/null || info "agent-device is not installed here; install it for UI automation: npm i -g agent-device"
+  MAC_USER="${target%@*}"; MAC_HOST="${target#*@}"; MAC_SSH="$alias_"; PROXY_MODE="$mode"
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  cat >"$CONF_DIR/config" <<EOF
+# macsim config (client side)
+MAC_SSH=$MAC_SSH
+MAC_HOST=$MAC_HOST
+MAC_USER=$MAC_USER
+# ssh = proxy reached through an SSH tunnel (Mac binds 127.0.0.1); direct = http://MAC_HOST:PROXY_PORT
+PROXY_MODE=$PROXY_MODE
+PROXY_PORT=$PROXY_PORT
+# default simulator name as listed by 'macsim devices' (empty = booted one / newest plain iPhone)
+DEVICE="$DEVICE"
+# default Metro port for 'macsim tunnel' (override per call: --metro-port N)
+METRO_PORT="$METRO_PORT"
+EOF
+  [ -s "$CONF_DIR/token" ] || { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' >"$CONF_DIR/token"; chmod 600 "$CONF_DIR/token"; }
+
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  if ! grep -qE "^Host $MAC_SSH\$" ~/.ssh/config 2>/dev/null; then
+    [ -f ~/.ssh/config ] && cp ~/.ssh/config ~/.ssh/config.bak-macsim
+    mkdir -p ~/.ssh/cm
+    cat >>~/.ssh/config <<EOF
+
+# added by macsim
+Host $MAC_SSH
+    HostName $MAC_HOST
+    User $MAC_USER
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%r@%h:%p
+    ControlPersist 10m
+    ServerAliveInterval 15
+
+EOF
+    info "added 'Host $MAC_SSH' to ~/.ssh/config"
+  else
+    info "using the existing 'Host $MAC_SSH' entry in ~/.ssh/config"
+  fi
+
+  info "copying your SSH key to the Mac (enter the Mac password once; Remote Login must be ON in System Settings > General > Sharing)"
+  ssh-copy-id -i "$(ssh_pubkey)" "$MAC_SSH" || die "ssh-copy-id failed"
+  ssh "${SSH_OPTS[@]}" "$MAC_SSH" "mkdir -p ~/.macsim" || offline
+  push_scripts
+  scp -q "$CONF_DIR/token" "$MAC_SSH:.macsim/token"
+
+  local bind=127.0.0.1; [ "$mode" = direct ] && bind=tailscale
+  local args=(--agent-device-version "$(agent-device --version 2>/dev/null || echo latest)" --port "$PROXY_PORT" --proxy-bind "$bind")
+  if [ $pc_access = 0 ] && [ -t 0 ]; then
+    read -rp "Let the Mac SSH back into this machine (adds the Mac's key to ~/.ssh/authorized_keys here)? [y/N] " a
+    [[ "$a" =~ ^[yY] ]] && pc_access=1
+  fi
+  [ $pc_access = 1 ] && args+=(--pc-host "$(client_addr)" --pc-user "$(whoami)")
+  info "running setup on the Mac (may ask for the Mac password for sudo)"
+  ssh -t "$MAC_SSH" "bash ~/.macsim/setup.sh $(q "${args[@]}")" || die "Mac setup failed"
+
+  if [ $pc_access = 1 ]; then
+    local mackey; mackey="$(ssh "${SSH_OPTS[@]}" "$MAC_SSH" 'cat ~/.ssh/id_ed25519.pub')"
+    if [ -n "$mackey" ] && ! grep -qF "$mackey" ~/.ssh/authorized_keys 2>/dev/null; then
+      echo "$mackey" >>~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; info "Mac key added to ~/.ssh/authorized_keys"
+    fi
+  fi
+  echo; cmd_status
+}
+
+cmd_uninstall() {
+  local keep="" yes=0
+  while [ $# -gt 0 ]; do case "$1" in --keep-builds) keep=--keep-builds; shift ;; -y|--yes) yes=1; shift ;; *) die "unknown option $1" ;; esac; done
+  if [ $yes = 0 ]; then
+    echo "This removes macsim from the Mac (LaunchAgent, ~/.macsim, ${keep:+kept: }project builds, PATH line, 'Host pc')"
+    echo "and from this machine (config, cache, tunnels, the 'Host $MAC_SSH' SSH entry)."
+    read -rp "Continue? [y/N] " a; [[ "$a" =~ ^[yY] ]] || exit 1
+  fi
+  local p; for p in "$CACHE_DIR"/*.pid; do pid_alive "$p" && kill "$(cat "$p")"; done
+  if ssh "${SSH_OPTS[@]}" "$MAC_SSH" true 2>/dev/null; then
+    ssh "${SSH_OPTS[@]}" "$MAC_SSH" "bash ~/.macsim/bin/macsim-remote uninstall $keep" || info "Mac-side uninstall reported an error"
+  else
+    info "Mac unreachable: skipped the Mac side. Later, on the Mac: bash ~/.macsim/bin/macsim-remote uninstall"
+  fi
+  if [ -f ~/.ssh/config ] && grep -q '^# added by macsim$' ~/.ssh/config; then
+    cp ~/.ssh/config ~/.ssh/config.bak-macsim
+    awk '/^# added by macsim$/{skip=1; next} skip && /^[[:space:]]*$/{skip=0; next} !skip' ~/.ssh/config.bak-macsim >~/.ssh/config
+    info "removed the macsim block from ~/.ssh/config (backup: ~/.ssh/config.bak-macsim)"
+  fi
+  if [ -f ~/.ssh/authorized_keys ] && grep -q '@mac-macsim$' ~/.ssh/authorized_keys; then
+    sed -i.bak-macsim '/@mac-macsim$/d' ~/.ssh/authorized_keys && info "removed the Mac's key from ~/.ssh/authorized_keys"
+  fi
+  rm -rf "$CONF_DIR" "$CACHE_DIR"
+  echo "Done. To also remove the commands and the agent skill: $REPO/install.sh --uninstall"
+}
+
+main() {
+  local args=()
+  while [ $# -gt 0 ]; do
+    if [ "$1" = --metro-port ]; then METRO_PORT="${2:?--metro-port needs a value}"; shift 2
+    else args+=("$1"); shift; fi
+  done
+  set -- ${args[@]+"${args[@]}"}
+  local c="${1:-help}"; [ $# -gt 0 ] && shift
+  case "$c" in
+    help|-h|--help) usage ;;
+    -V|--version|version) echo "macsim $VERSION" ;;
+    bootstrap) cmd_bootstrap "$@" ;;
+    status|doctor) cmd_status ;;
+    uninstall) need_config; cmd_uninstall "$@" ;;
+    push) need_config; push_scripts ;;
+    sync) need_config; cmd_sync "$@" ;;
+    build) need_config; cmd_build "$@" ;;
+    install) need_config; cmd_install "$@" ;;
+    launch) need_config; r launch "${1:?bundle id}" "$DEVICE" ;;
+    open-url|openurl) need_config; r openurl "${1:?url}" "$DEVICE" ;;
+    screenshot) need_config; cmd_screenshot "$@" ;;
+    boot) need_config; r boot "${1:-$DEVICE}" ;;
+    shutdown) need_config; r shutdown ;;
+    devices) need_config; r devices ;;
+    list) need_config; r list ;;
+    clean) need_config; r clean "$@" ;;
+    tunnel) need_config
+      case "${1:-status}" in
+        start) tunnel_start ;; stop) tunnel_stop ;;
+        status) if pid_alive "$(tun_pid)"; then echo "up (pid $(cat "$(tun_pid)"))"; else echo "down"; fi ;;
+        *) die "tunnel start|stop|status" ;;
+      esac ;;
+    expo-go) need_config; cmd_expo_go "$@" ;;
+    dev-client) need_config; cmd_dev_client "$@" ;;
+    view) need_config; cmd_view "$@" ;;
+    ssh) need_config; if [ $# -eq 0 ]; then exec ssh -t "$MAC_SSH"; else ssh "${SSH_OPTS[@]}" "$MAC_SSH" ". ~/.macsim/env.sh; $*"; fi ;;
+    _proxy-url) need_config; proxy_url ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+main "$@"

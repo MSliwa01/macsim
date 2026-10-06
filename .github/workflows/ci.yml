@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: shellcheck install.sh bin/macsim bin/ios-device mac/setup.sh mac/bin/* tests/*.sh
+      - name: mac/ compatibility (BSD userland, bash 3.2)
+        run: tests/mac-compat.sh
+      - name: offline tests (fake Mac)
+        run: tests/run.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: parse Mac scripts with the system bash (3.2)
+        run: for f in mac/setup.sh mac/bin/*; do /bin/bash -n "$f" || exit 1; done

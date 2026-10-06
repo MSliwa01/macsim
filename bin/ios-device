@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# ios-device: agent-device connected to the Mac's iOS Simulator through the macsim proxy.
+# Usage is identical to agent-device, e.g.  ios-device open com.example.app --platform ios
+#
+# - Uses its own agent-device state dir, so plain `agent-device` on this machine stays local.
+# - `open` without --device/--udid targets the macsim simulator (booting it if needed), so an
+#   agent never grabs a physical iPhone that happens to be paired with the Mac.
+# - `ios-device reconnect` re-creates the proxy connection.
+set -uo pipefail
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/macsim"
+[ -s "$CONF/token" ] || { echo "ios-device: not configured. Run 'macsim bootstrap' first." >&2; exit 1; }
+command -v agent-device >/dev/null || { echo "ios-device: agent-device is not installed (npm i -g agent-device)" >&2; exit 1; }
+export AGENT_DEVICE_STATE_DIR="$CONF/agent-device-state"
+AGENT_DEVICE_DAEMON_AUTH_TOKEN="$(cat "$CONF/token")"
+export AGENT_DEVICE_DAEMON_AUTH_TOKEN
+
+case "${1:-}" in
+  ""|help|--help|-h|--version) exec agent-device "$@" ;;
+esac
+
+url="$(macsim _proxy-url)" || exit 1
+marker="$AGENT_DEVICE_STATE_DIR/.macsim-url"
+if [ "${1:-}" = reconnect ] || [ ! -d "$AGENT_DEVICE_STATE_DIR/remote-connections" ] || [ "$(cat "$marker" 2>/dev/null)" != "$url" ]; then
+  mkdir -p "$AGENT_DEVICE_STATE_DIR"
+  agent-device connect proxy --force --daemon-base-url "$url/agent-device" \
+    --daemon-auth-token "$AGENT_DEVICE_DAEMON_AUTH_TOKEN" >/dev/null || exit 1
+  echo "$url" >"$marker"
+  [ "${1:-}" = reconnect ] && { echo "connected to $url"; exit 0; }
+fi
+
+if [ "${1:-}" = open ]; then
+  has_target=0
+  for a in "$@"; do case "$a" in --device|--device=*|--udid|--udid=*|--serial|--serial=*) has_target=1 ;; esac; done
+  if [ $has_target = 0 ]; then
+    udid="$(macsim boot 2>/dev/null | tail -1)" || exit 1
+    [ -n "$udid" ] && set -- "$@" --udid "$udid"
+  fi
+fi
+exec agent-device "$@"
