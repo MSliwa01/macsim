@@ -8,6 +8,7 @@
 
 Fixes found by end-to-end runs on a real Mac and by review:
 
+- Re-running `macsim bootstrap` (or `setup.sh`) on an existing install left the proxy down: launchd hadn't finished unloading the old LaunchAgent, so loading the new one failed with `Bootstrap failed: 5: Input/output error`. Setup now waits for the unload, and fails loudly if the agent still doesn't load.
 - XcodeGen projects that also commit the `.xcodeproj` alternated between passing and failing builds: every sync put the client's project back and `xcodegen --use-cache` kept it. XcodeGen now always regenerates.
 - Bare React Native / Expo with a checked-in `ios/`: the Pods `*.xcworkspace` (and `Podfile.lock`) made on the Mac was deleted by the next sync. They are now protected, and a missing workspace re-runs `pod install`.
 - `pod install` now also runs when JS dependencies change (new native modules) and no longer runs on every build when the client's `Podfile.lock` is older than the Mac's.

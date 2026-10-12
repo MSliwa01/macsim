@@ -16,7 +16,17 @@ shift
 cd "$FAKE_MAC" && HOME="$FAKE_MAC" PATH="$FAKE_BIN:$PATH" exec bash -c "$*"
 SH
 # macOS-only tools used by the paths under test
-printf '#!/bin/sh\nexit 0\n' >"$T/bin/launchctl"; cp "$T/bin/launchctl" "$T/bin/xcrun"
+printf '#!/bin/sh\nexit 0\n' >"$T/bin/xcrun"
+cat >"$T/bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+# like the real one, bootout returns while the job is still loaded (here: for 2 more `print`s)
+st="$FAKE_MAC/.launchctl-unloading"; n="$(cat "$st" 2>/dev/null || echo 0)"
+case "$1" in
+  bootout) echo 2 >"$st"; rm -f "$FAKE_MAC/.launchctl-loaded" ;;
+  print) [ "$n" -gt 0 ] && { echo $((n-1)) >"$st"; exit 0; }; [ -f "$FAKE_MAC/.launchctl-loaded" ] ;;
+  bootstrap) [ "$n" -gt 0 ] && { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }; touch "$FAKE_MAC/.launchctl-loaded" ;;
+esac
+SH
 cat >"$T/bin/sed" <<'SH'
 #!/usr/bin/env bash
 # accept BSD `sed -i ''` on GNU sed
@@ -211,8 +221,9 @@ check "bootstrap --pc-access: Host pc on the Mac"   grep -q '^Host pc$' "$FAKE_M
 check "bootstrap --pc-access: Mac key authorized"   grep -q 'mac-macsim$' "$HOME/.ssh/authorized_keys"
 # re-running setup keeps user edits to the Mac config
 sed -i 's/^PROXY_BIND=.*/PROXY_BIND=tailscale/' "$mc"
-HOME="$FAKE_MAC" PATH="$FAKE_BIN:$PATH" bash "$FAKE_MAC/.macsim/setup.sh" </dev/null >/dev/null 2>&1
+HOME="$FAKE_MAC" PATH="$FAKE_BIN:$PATH" bash "$FAKE_MAC/.macsim/setup.sh" </dev/null >"$T/setup2.log" 2>&1; rc=$?
 check "setup.sh re-run keeps PROXY_BIND"            grep -q '^PROXY_BIND=tailscale$' "$mc"
+check "setup.sh re-run reloads the LaunchAgent"     test "$rc" = 0 -a -n "$(grep 'LaunchAgent loaded' "$T/setup2.log")"
 [ "$fail" = 0 ] || { echo "--- bootstrap log"; tail -20 "$T/bootstrap.log"; }
 
 echo; echo "$pass passed, $fail failed"

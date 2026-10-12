@@ -133,7 +133,16 @@ cat >"$PLIST" <<EOF
 EOF
 dom="gui/$(id -u)"
 launchctl bootout "$dom/com.macsim.proxy" >/dev/null 2>&1
-launchctl bootstrap "$dom" "$PLIST" && echo "proxy LaunchAgent loaded (log: ~/.macsim/logs/proxy.log)"
+# bootout returns before the old job is gone; bootstrapping right away fails ("5: Input/output error").
+LOADED=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if ! launchctl print "$dom/com.macsim.proxy" >/dev/null 2>&1 && launchctl bootstrap "$dom" "$PLIST" 2>/dev/null; then
+    LOADED=1; break
+  fi
+  sleep 1
+done
+if [ $LOADED = 1 ]; then echo "proxy LaunchAgent loaded (log: ~/.macsim/logs/proxy.log)"
+else echo "ERROR: could not load the proxy LaunchAgent: launchctl bootstrap $dom $PLIST"; fi
 [ "$BIND" = 127.0.0.1 ] || echo "If macOS asks whether 'node' may accept incoming connections: click Allow."
 
 step "Shell PATH"
@@ -175,3 +184,4 @@ On the Mac (open a new terminal first so PATH is updated):
   macserver status
   pc                 tmux session on the client machine (if enabled)
 EOF
+[ $LOADED = 1 ]
