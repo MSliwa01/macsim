@@ -60,7 +60,7 @@ json_devices() {
 resolve_device() {
   local want="${1:-${DEFAULT_DEVICE:-}}" rows udid="" state=""
   rows="$(json_devices)" || die "simctl failed (is Xcode installed?)"
-  [ -n "$rows" ] || die "no iOS simulators available — install an iOS runtime: xcodebuild -downloadPlatform iOS"
+  [ -n "$rows" ] || die "no iOS simulators available. Install an iOS runtime: xcodebuild -downloadPlatform iOS"
   if [ -n "$want" ]; then
     local line
     line="$(printf '%s\n' "$rows" | awk -F'\t' -v w="$want" '$1==w || $3==w {print; exit}')"
@@ -289,7 +289,7 @@ cmd_view() {
   local logf="$MACSIM_HOME/logs/serve-sim.log" port="${VIEW_PORT:-3200}"
   case "${1:-start}" in
     start)
-      command -v serve-sim >/dev/null || die "serve-sim not installed — re-run: bash ~/.macsim/setup.sh"
+      command -v serve-sim >/dev/null || die "serve-sim not installed. Re-run: bash ~/.macsim/setup.sh"
       if pgrep -f 'serve-sim/dist/serve-sim.js' >/dev/null && curl -fs -m 2 -o /dev/null "http://127.0.0.1:$port/"; then
         echo "VIEW_PORT=$port"; return 0
       fi
@@ -373,7 +373,7 @@ cmd_list() {
 cmd_doctor() {
   local ok=1
   chk() { if eval "$2" >/dev/null 2>&1; then printf '  ok   %s\n' "$1"; else printf '  FAIL %s  -> %s\n' "$1" "$3"; ok=0; fi; }
-  echo "Mac: $(scutil --get ComputerName 2>/dev/null) — macOS $(sw_vers -productVersion) — $(sysctl -n hw.memsize | awk '{printf "%.0f GB RAM", $1/1073741824}')"
+  echo "Mac: $(scutil --get ComputerName 2>/dev/null), macOS $(sw_vers -productVersion), $(sysctl -n hw.memsize | awk '{printf "%.0f GB RAM", $1/1073741824}')"
   chk "Xcode selected"        'xcode-select -p | grep -q Xcode' 'install Xcode, then: sudo xcode-select -s /Applications/Xcode.app'
   chk "xcodebuild works"      'xcodebuild -version'             'sudo xcodebuild -license accept && xcodebuild -runFirstLaunch'
   chk "iOS runtime present"   'xcrun simctl list runtimes | grep -q "iOS"' 'xcodebuild -downloadPlatform iOS'

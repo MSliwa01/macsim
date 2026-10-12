@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `macserver status` shows the size of `~/.macsim/builds`, where new installs keep projects, and of `~/builds` if an older install still has it.
+- `macsim view` tries `wslview` before `xdg-open`, so under WSL the preview opens in the Windows browser.
+- Script messages use plain punctuation instead of em dashes.
+
 ## 0.1.0 (2026-10-06)
 
 First public version.

@@ -76,7 +76,8 @@ EOF
 sha1() { if command -v sha1sum >/dev/null; then sha1sum; else shasum -a 1; fi | cut -c1-40; }
 open_browser() {
   local u="$1" c
-  for c in xdg-open wslview open; do command -v "$c" >/dev/null && { "$c" "$u" >/dev/null 2>&1 & return; }; done
+  # wslview first: under WSL it opens the Windows browser, where xdg-open often has nothing to open.
+  for c in wslview xdg-open open; do command -v "$c" >/dev/null && { "$c" "$u" >/dev/null 2>&1 & return; }; done
 }
 pid_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
