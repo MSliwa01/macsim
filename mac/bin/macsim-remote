@@ -63,7 +63,9 @@ resolve_device() {
   [ -n "$rows" ] || die "no iOS simulators available. Install an iOS runtime: xcodebuild -downloadPlatform iOS"
   if [ -n "$want" ]; then
     local line
-    line="$(printf '%s\n' "$rows" | awk -F'\t' -v w="$want" '$1==w || $3==w {print; exit}')"
+    # Same name on several runtimes: reuse a booted one rather than booting a second simulator.
+    line="$(printf '%s\n' "$rows" | awk -F'\t' -v w="$want" '($1==w || $3==w) && $2=="Booted" {print; exit}')"
+    [ -n "$line" ] || line="$(printf '%s\n' "$rows" | awk -F'\t' -v w="$want" '$1==w || $3==w {print; exit}')"
     [ -n "$line" ] || die "no simulator named '$want'. Available: $(printf '%s\n' "$rows" | cut -f3 | sort -u | tr '\n' ',' )"
     udid="$(printf '%s' "$line" | cut -f1)"; state="$(printf '%s' "$line" | cut -f2)"
   else
@@ -93,11 +95,15 @@ resolve_device() {
 bundle_id_of() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Info.plist" 2>/dev/null; }
 
 summarize_failure() {
-  local logf="$1"
+  # Paths under the synced copy ($SRC) are shown relative to the project, so they match the client checkout.
+  # shellcheck disable=SC2016  # awk program
+  local logf="$1" rel='{ if (p != "") while ((i = index($0, p)) > 0) $0 = substr($0, 1, i-1) substr($0, i+length(p)); print }'
+  local p=""; [ -n "${SRC:-}" ] && p="$SRC/"
   echo "---- errors ($logf) ----" >&2
-  grep -E '(error|fatal error):|\*\* BUILD FAILED|❌|CommandError|Error:' "$logf" | grep -v '^[[:space:]]*$' | awk '!seen[$0]++' | head -40 >&2
+  grep -E '(error|fatal error):|\*\* BUILD FAILED|❌|CommandError|Error:' "$logf" | grep -v '^[[:space:]]*$' \
+    | awk -v p="$p" "$rel" | awk '!seen[$0]++' | head -40 >&2
   echo "---- last 30 lines ----" >&2
-  tail -30 "$logf" >&2
+  tail -30 "$logf" | awk -v p="$p" "$rel" >&2
 }
 
 deps_install() {
@@ -109,8 +115,11 @@ deps_install() {
   elif [ -f "$dir/yarn.lock" ];      then lock="$dir/yarn.lock";      cmd="yarn install"
   elif [ -f "$dir/package-lock.json" ]; then lock="$dir/package-lock.json"; cmd="npm ci"
   else lock="$dir/package.json"; cmd="npm install"; fi
-  local sum; sum="$(cat "$lock" "$dir/package.json" | shasum | cut -d' ' -f1)"
+  # Also hash what changes the install without touching the lockfile: patch-package patches, npm/yarn/pnpm config.
+  local sum; sum="$( { cat "$lock" "$dir/package.json"; cat "$dir/.npmrc" "$dir/.yarnrc.yml" "$dir/pnpm-workspace.yaml" 2>/dev/null
+                       [ -d "$dir/patches" ] && find "$dir/patches" -type f -print0 | sort -z | xargs -0 cat; } | shasum | cut -d' ' -f1)"
   if [ -d "$dir/node_modules" ] && [ "$(cat "$dir/.macsim-deps" 2>/dev/null)" = "$sum" ]; then return 0; fi
+  command -v "${cmd%% *}" >/dev/null || die "${cmd%% *} is not installed on the Mac (this project has a ${lock##*/}). Install it there, e.g. npm i -g ${cmd%% *}"
   log "installing JS deps ($cmd)"
   (cd "$dir" && $cmd) >"$LOGDIR/deps.log" 2>&1 || { summarize_failure "$LOGDIR/deps.log"; die "dependency install failed"; }
   echo "$sum" >"$dir/.macsim-deps"
@@ -120,13 +129,35 @@ pods_install() {
   local iosdir="$1"
   [ -f "$iosdir/Podfile" ] || return 0
   command -v pod >/dev/null || die "CocoaPods not installed on Mac (brew install cocoapods)"
-  local sum; sum="$(cat "$iosdir/Podfile" "$iosdir/Podfile.lock" 2>/dev/null | shasum | cut -d' ' -f1)"
-  if [ -d "$iosdir/Pods" ] && [ "$(cat "$iosdir/.macsim-pods" 2>/dev/null)" = "$sum" ]; then return 0; fi
+  # .macsim-pods holds the input hash from before and after the last install. Both count as
+  # up to date: a Podfile.lock synced from the client can lag behind the one pod install wrote.
+  local sum; sum="$(pods_inputs "$iosdir")"
+  if [ -d "$iosdir/Pods" ] && ls -d "$iosdir"/*.xcworkspace >/dev/null 2>&1 && grep -qxF "$sum" "$iosdir/.macsim-pods" 2>/dev/null; then
+    # Xcode's "Check Pods Manifest.lock" phase fails unless Podfile.lock matches the installed pods.
+    if [ -f "$iosdir/Pods/Manifest.lock" ] && ! cmp -s "$iosdir/Podfile.lock" "$iosdir/Pods/Manifest.lock"; then
+      cp "$iosdir/Pods/Manifest.lock" "$iosdir/Podfile.lock"
+    fi
+    return 0
+  fi
   log "pod install"
   (cd "$iosdir" && pod install) >"$LOGDIR/pods.log" 2>&1 || { summarize_failure "$LOGDIR/pods.log"; die "pod install failed"; }
-  sum="$(cat "$iosdir/Podfile" "$iosdir/Podfile.lock" 2>/dev/null | shasum | cut -d' ' -f1)"
-  echo "$sum" >"$iosdir/.macsim-pods"
+  { echo "$sum"; pods_inputs "$iosdir"; } >"$iosdir/.macsim-pods"
 }
+
+# Pods depend on the Podfile, its lock and, for RN/Expo, the JS deps (autolinking reads node_modules).
+# Fingerprint of a freshly prebuilt ios/ (paths + contents), without what pod install adds later.
+# Config plugins give some pbxproj objects random IDs (and pbxproj sorts by ID), so pbxproj files
+# are compared with IDs blanked and lines sorted.
+prebuild_output_hash() {
+  (cd "$1" && find . \( -name Pods -o -name build -o -name '*.xcworkspace' -o -name xcuserdata \) -prune \
+      -o -type f ! -name Podfile.lock ! -name '.macsim-*' -print | LC_ALL=C sort \
+    | while IFS= read -r f; do
+        echo "$f"
+        case "$f" in *.pbxproj) sed -E 's/[0-9A-F]{24}/X/g' "$f" | LC_ALL=C sort ;; *) cat "$f" ;; esac
+      done) | shasum | cut -d' ' -f1
+}
+
+pods_inputs() { cat "$1/Podfile" "$1/Podfile.lock" "${SRC:-$1}/.macsim-deps" 2>/dev/null | shasum | cut -d' ' -f1; }
 
 find_xcode_container() {
   # prints "-workspace PATH" or "-project PATH"
@@ -141,6 +172,23 @@ find_xcode_container() {
 }
 
 pick_scheme() {
+  local kind="$1" path="$2" base
+  base="$(basename "$path")"; base="${base%.*}"
+  # Fast path: a shared scheme named after the project (RN, Expo, most apps). `xcodebuild -list`
+  # resolves the whole workspace and can take 10+ s with Pods or SwiftPM packages.
+  [ -f "$(dirname "$path")/$base.xcodeproj/xcshareddata/xcschemes/$base.xcscheme" ] && { echo "$base"; return; }
+  # Otherwise cache the answer until the project or its scheme files change.
+  local cache="${LOGDIR:-/tmp}/scheme.cache" key s
+  key="$( { echo "$kind $path"; cat "$path/project.pbxproj" "$path/contents.xcworkspacedata" 2>/dev/null
+            find "$(dirname "$path")" -maxdepth 4 \( -name node_modules -o -name Pods \) -prune -o -name '*.xcscheme' -print 2>/dev/null
+          } | shasum | cut -d' ' -f1)"
+  if [ "$(sed -n 1p "$cache" 2>/dev/null)" = "$key" ]; then sed -n 2p "$cache"; return; fi
+  s="$(list_scheme "$kind" "$path")"
+  [ -n "$s" ] && printf '%s\n%s\n' "$key" "$s" >"$cache"
+  echo "$s"
+}
+
+list_scheme() {
   local kind="$1" path="$2"
   xcodebuild -list -json "$kind" "$path" 2>/dev/null | node -e '
     let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
@@ -154,8 +202,18 @@ pick_scheme() {
 install_and_launch() {
   local udid="$1" app="$2" launch="$3" bid
   bid="$(bundle_id_of "$app")"
-  log "installing $(basename "$app") ($bid)"
-  xcrun simctl install "$udid" "$app" || die "simctl install failed"
+  # Skip the copy when this exact build is still what the simulator has: nothing in the .app is
+  # newer than our marker, and the installed container is the one we recorded (each install gets
+  # a new one, so another checkout installing the same bundle id is noticed).
+  local mark; mark="$(dirname "$app")/.macsim-installed-$udid"
+  if [ -f "$mark" ] && [ -z "$(find "$app" -newer "$mark" -print 2>/dev/null | head -1)" ] \
+     && [ "$(xcrun simctl get_app_container "$udid" "$bid" 2>/dev/null)" = "$(cat "$mark")" ]; then
+    log "$(basename "$app") unchanged, already installed"
+  else
+    log "installing $(basename "$app") ($bid)"
+    xcrun simctl install "$udid" "$app" || die "simctl install failed"
+    xcrun simctl get_app_container "$udid" "$bid" >"$mark" 2>/dev/null || rm -f "$mark"
+  fi
   if [ "$launch" = "1" ]; then
     xcrun simctl launch --terminate-running-process "$udid" "$bid" >/dev/null || die "launch failed"
   fi
@@ -175,7 +233,7 @@ cmd_build_xcode() {
     *) die "build-xcode: unknown arg $1" ;; esac; done
   local root; root="$(proj_dir "$name")"; local src="$root/src"
   [ -d "$src" ] || die "project not synced: $name"
-  LOGDIR="$root/logs"; mkdir -p "$LOGDIR"; touch_used "$root"
+  LOGDIR="$root/logs" SRC="$src"; mkdir -p "$LOGDIR"; touch_used "$root"
 
   # React Native bare: JS deps + pods first.
   deps_install "$src"
@@ -188,7 +246,9 @@ cmd_build_xcode() {
     [ -f "$yml" ] || continue
     command -v xcodegen >/dev/null || die "project.yml found but xcodegen missing on Mac (brew install xcodegen)"
     log "xcodegen generate"
-    (cd "$(dirname "$yml")" && xcodegen generate --use-cache --quiet) >"$LOGDIR/xcodegen.log" 2>&1 \
+    # No --use-cache: when the client also commits the .xcodeproj, every sync puts that copy back,
+    # and the cache (keyed on the spec) would then keep a stale project. Generating takes well under 1 s.
+    (cd "$(dirname "$yml")" && xcodegen generate --quiet) >"$LOGDIR/xcodegen.log" 2>&1 \
       || { summarize_failure "$LOGDIR/xcodegen.log"; die "xcodegen failed"; }
     # Keep SPM pins from a committed Package.resolved, if the project has one.
     local pr xp; pr="$(dirname "$yml")/Package.resolved"
@@ -209,37 +269,69 @@ cmd_build_xcode() {
   log "xcodebuild $(basename "$path") scheme=$scheme config=$config"
   if ! xcodebuild "$kind" "$path" -scheme "$scheme" -configuration "$config" \
         -destination "id=$udid" -derivedDataPath "$root/dd" \
+        -skipPackagePluginValidation -skipMacroValidation -hideShellScriptEnvironment \
         COMPILER_INDEX_STORE_ENABLE=NO build >"$logf" 2>&1; then
     summarize_failure "$logf"; die "BUILD FAILED (full log on Mac: $logf)"
   fi
   log "build ok in $(( $(date +%s) - t0 ))s"
   local app
-  app="$(ls -td "$root/dd/Build/Products/$config-iphonesimulator/"*.app 2>/dev/null | head -1)"
+  # Usually named after the scheme; else the newest (DerivedData is shared by all schemes).
+  local products="$root/dd/Build/Products/$config-iphonesimulator"
+  if [ -d "$products/$scheme.app" ]; then app="$products/$scheme.app"
+  else app="$(ls -td "$products/"*.app 2>/dev/null | head -1)"; fi
   [ -n "$app" ] || die "build succeeded but no .app found"
   install_and_launch "$udid" "$app" "$launch"
 }
 
 cmd_build_expo() {
   local name="$1"; shift
-  local config="Debug" device="" prebuild=0 launch=1
+  local config="Debug" device="" scheme="" prebuild=0 launch=1 cng=0
   while [ $# -gt 0 ]; do case "$1" in
     --configuration) config="$2"; shift 2 ;; --device) device="$2"; shift 2 ;;
     --prebuild) prebuild=1; shift ;; --no-launch) launch=0; shift ;;
-    --scheme) shift 2 ;;
+    --scheme) scheme="$2"; shift 2 ;; --cng) cng=1; shift ;;
     *) die "build-expo: unknown arg $1" ;; esac; done
   local root; root="$(proj_dir "$name")"; local src="$root/src"
   [ -d "$src" ] || die "project not synced: $name"
-  LOGDIR="$root/logs"; mkdir -p "$LOGDIR"; touch_used "$root"
+  LOGDIR="$root/logs" SRC="$src"; mkdir -p "$LOGDIR"; touch_used "$root"
   deps_install "$src"
-  if [ "$prebuild" = "1" ] || [ ! -d "$src/ios" ]; then
+  # CNG (the client has no ios/): the generated ios/ goes stale when the app config or the
+  # dependencies (config plugins) change, so prebuild again then.
+  local cfg=""
+  [ "$cng" = 1 ] && cfg="$(cd "$src" && { cat app.json app.config.js app.config.ts app.config.mjs app.config.cjs \
+    .macsim-deps 2>/dev/null; [ -d plugins ] && find plugins -type f -print0 | sort -z | xargs -0 cat; } | shasum | cut -d' ' -f1)"
+  if [ "$prebuild" = "1" ] || [ ! -d "$src/ios" ] || { [ -n "$cfg" ] && [ "$(cat "$src/.macsim-prebuild" 2>/dev/null)" != "$cfg" ]; }; then
     local clean=""; [ "$prebuild" = "1" ] && clean="--clean"
+    # Even without --clean, prebuild recreates ios/ from scratch: a new, not yet Pods-integrated
+    # project, so pod install plus a mostly full rebuild (minutes on a small Mac). Keep the old
+    # ios/ aside and compare the fresh output with the previous prebuild's: if the native project
+    # didn't change (most app.json edits), put the old ios/ back. Otherwise reuse its Pods so
+    # pod install only applies the difference.
+    local prev="$root/ios-prev" f rc
+    rm -rf "$prev"
+    [ -z "$clean" ] && [ -d "$src/ios" ] && mv "$src/ios" "$prev"
     log "expo prebuild -p ios $clean"
-    (cd "$src" && CI=1 npx expo prebuild -p ios --no-install $clean) >"$LOGDIR/prebuild.log" 2>&1 \
-      || { summarize_failure "$LOGDIR/prebuild.log"; die "expo prebuild failed"; }
+    (cd "$src" && CI=1 npx expo prebuild -p ios --no-install $clean) >"$LOGDIR/prebuild.log" 2>&1; rc=$?
+    if [ $rc != 0 ]; then
+      [ -d "$prev" ] && { rm -rf "$src/ios"; mv "$prev" "$src/ios"; }
+      rm -f "$src/.macsim-prebuild"; summarize_failure "$LOGDIR/prebuild.log"; die "expo prebuild failed"
+    fi
+    local out; out="$(prebuild_output_hash "$src/ios")"
+    if [ -d "$prev" ] && [ "$out" = "$(cat "$root/.prebuild-output" 2>/dev/null)" ]; then
+      rm -rf "$src/ios"; mv "$prev" "$src/ios"; log "native project unchanged, kept the existing ios/"
+    elif [ -d "$prev" ]; then
+      for f in "$prev"/Pods "$prev"/Podfile.lock "$prev"/*.xcworkspace; do
+        [ -e "$f" ] && [ ! -e "$src/ios/$(basename "$f")" ] && mv "$f" "$src/ios/"
+      done
+      rm -rf "$prev"
+    fi
+    echo "$out" >"$root/.prebuild-output"
+    [ -n "$cfg" ] && echo "$cfg" >"$src/.macsim-prebuild"
   fi
   # Build the generated native project with plain xcodebuild (same path as Swift apps):
   # no AppleScript/window activation, no Metro on the Mac, DerivedData stays in $BUILDS.
   local pass=(--configuration "$config"); [ -n "$device" ] && pass+=(--device "$device")
+  [ -n "$scheme" ] && pass+=(--scheme "$scheme")
   [ "$launch" = "1" ] || pass+=(--no-launch)
   cmd_build_xcode "$name" "${pass[@]}"
 }
@@ -268,11 +360,13 @@ cmd_install() {
 cmd_expo_go() {
   local url="$1" device="${2:-}" udid
   udid="$(resolve_device "$device")" || exit 1
-  if xcrun simctl get_app_container "$udid" host.exp.Exponent >/dev/null 2>&1 && [ -z "${FORCE:-}" ]; then
-    echo "Expo Go already installed"; return 0
-  fi
   local d="$BUILDS/_artifacts/expo-go"; mkdir -p "$d"
   local f; f="$d/$(basename "$url")"
+  # Expo Go only opens projects of its own SDK, so remember which build each simulator has.
+  if xcrun simctl get_app_container "$udid" host.exp.Exponent >/dev/null 2>&1 \
+     && [ "$(cat "$d/installed-$udid" 2>/dev/null)" = "$url" ]; then
+    echo "Expo Go already installed"; return 0
+  fi
   if [ ! -f "$f" ]; then
     log "downloading $(basename "$url")"
     curl -fsSL "$url" -o "$f.part" || die "download failed"
@@ -282,6 +376,7 @@ cmd_expo_go() {
   local app; app="$(find "$d/app" -maxdepth 2 -name '*.app' -type d | head -1)"
   [ -n "$app" ] || app="$d/app"   # some releases tar the bundle contents directly
   xcrun simctl install "$udid" "$app" || die "Expo Go install failed"
+  echo "$url" >"$d/installed-$udid"
   echo "Expo Go installed"
 }
 
@@ -307,6 +402,13 @@ cmd_view() {
   esac
 }
 
+cmd_screenshot() { # writes the PNG to stdout
+  local udid f; udid="$(resolve_device "${1:-}")" || exit 1
+  f="$(mktemp "${TMPDIR:-/tmp}/macsim-shot.XXXXXX")" || die "mktemp failed"
+  xcrun simctl io "$udid" screenshot --type=png "$f" >/dev/null 2>&1 || { rm -f "$f"; die "simctl screenshot failed"; }
+  cat "$f"; rm -f "$f"
+}
+
 cmd_devices() {
   json_devices | awk -F'\t' '{printf "%-8s %-28s %-10s %s\n",$2,$3,$4,$1}'
 }
@@ -322,7 +424,9 @@ cmd_clean() {
           echo "removing $(basename "$d") ($(du -sh "$d" | cut -f1))"; rm -rf "$d"
         fi
       done
-      rm -rf "$BUILDS/_artifacts"/*.d 2>/dev/null ;;
+      rm -rf "$BUILDS/_artifacts"/*.d 2>/dev/null
+      # uploaded builds (macsim install) and Expo Go downloads
+      find "$BUILDS/_artifacts" -type f -mtime +"$days" -not -name 'installed-*' -delete 2>/dev/null ;;
     --all)
       echo "removing everything in $BUILDS ($(du -sh "$BUILDS" 2>/dev/null | cut -f1))"
       rm -rf "${BUILDS:?}"/* ;;
@@ -348,7 +452,8 @@ cmd_uninstall() {
   done
   if [ -f "$HOME/.ssh/config" ] && grep -q '^# added by macsim$' "$HOME/.ssh/config"; then
     cp "$HOME/.ssh/config" "$HOME/.ssh/config.bak-macsim"
-    awk '/^# added by macsim$/{skip=1; next} skip && /^[[:space:]]*$/{skip=0; next} !skip' \
+    awk '/^# added by macsim$/{skip=1; next} skip && /^[[:space:]]*$/{skip=0; next}
+         skip && /^(Host|Match)[[:space:]]/ && $0 != "Host pc" {skip=0} !skip' \
       "$HOME/.ssh/config.bak-macsim" >"$HOME/.ssh/config"
   fi
   if [ "$keep_builds" = 1 ]; then
@@ -382,7 +487,7 @@ cmd_doctor() {
   chk "serve-sim (preview)"   'command -v serve-sim'            're-run setup.sh'
   chk "cocoapods (RN/Expo)"   'command -v pod'                  'brew install cocoapods'
   chk "proxy LaunchAgent"     "launchctl print gui/$(id -u)/com.macsim.proxy" 'bash ~/.macsim/setup.sh'
-  chk "token present"         "test -s $MACSIM_HOME/token"      'run macsim bootstrap from the client'
+  chk "token present"         "test -s '$MACSIM_HOME/token'"      'run macsim bootstrap from the client'
   local ip; ip="$(proxy_host)"
   chk "proxy bind address (${PROXY_BIND:-tailscale}: ${ip:-none})" "test -n '$ip'" 'start Tailscale, or set PROXY_BIND in ~/.macsim/config'
   chk "proxy /health"         "curl -fsS -m 3 http://$ip:$PROXY_PORT/health" "see ~/.macsim/logs/proxy.log"
@@ -405,9 +510,9 @@ main() {
     devices)     cmd_devices ;;
     view)        cmd_view "$@" ;;
     launch)      local u; u="$(resolve_device "${2:-}")" && xcrun simctl launch --terminate-running-process "$u" "$1" ;;
-    terminate)   xcrun simctl terminate booted "$1" ;;
+    terminate)   local u; u="$(resolve_device "${2:-}")" && xcrun simctl terminate "$u" "$1" ;;
     openurl)     local u; u="$(resolve_device "${2:-}")" && xcrun simctl openurl "$u" "$1" ;;
-    screenshot)  xcrun simctl io booted screenshot --type=png "$1" >/dev/null && echo "$1" ;;
+    screenshot)  cmd_screenshot "$@" ;;
     shutdown)    xcrun simctl shutdown all; osascript -e 'quit app "Simulator"' -e 'quit app "DeviceHub"' >/dev/null 2>&1; echo "all simulators shut down" ;;
     clean)       cmd_clean "$@" ;;
     list)        cmd_list ;;

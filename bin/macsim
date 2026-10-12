@@ -23,8 +23,16 @@ PROXY_MODE="${PROXY_MODE:-direct}"
 # One Metro port per invocation: --metro-port N  >  $MACSIM_METRO_PORT  >  config (default 8081)
 METRO_PORT="${MACSIM_METRO_PORT:-${METRO_PORT%% *}}"
 
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6)
-die()  { echo "macsim: $*" >&2; exit 1; }
+SSH_BASE=(-o BatchMode=yes -o ConnectTimeout=6)
+# Commands share one multiplexed connection, so each round trip is cheap even when ~/.ssh/config
+# has no ControlMaster entry. The short keepalive drops a stale master quickly when the Mac sleeps.
+# (ssh uses the first value given for an option, so tunnels need their own list: TUN_OPTS.)
+SSH_OPTS=("${SSH_BASE[@]}" -o ControlMaster=auto -o 'ControlPath=~/.ssh/cm/macsim-%C' -o ControlPersist=10m
+          -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
+TUN_OPTS=("${SSH_BASE[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none
+          -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+mkdir -p ~/.ssh/cm 2>/dev/null
+die() { echo "macsim: $*" >&2; exit 1; }
 info() { echo "» $*" >&2; }
 
 usage() {
@@ -79,7 +87,11 @@ open_browser() {
   # wslview first: under WSL it opens the Windows browser, where xdg-open often has nothing to open.
   for c in wslview xdg-open open; do command -v "$c" >/dev/null && { "$c" "$u" >/dev/null 2>&1 & return; }; done
 }
-pid_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+# Pid files outlive reboots, so also check the pid still belongs to an ssh (not a reused pid).
+pid_alive() {
+  local p; [ -f "$1" ] && p="$(cat "$1")" && kill -0 "$p" 2>/dev/null || return 1
+  case "$(ps -o args= -p "$p" 2>/dev/null)" in *ssh*) return 0 ;; *) return 1 ;; esac
+}
 
 # ---------- remote plumbing ----------
 
@@ -123,14 +135,18 @@ proxy_url() {
   local url="http://127.0.0.1:$PROXY_PORT"
   if ! curl -fs -m 2 -o /dev/null "$url/health"; then
     pid_alive "$PROXY_PID" && kill "$(cat "$PROXY_PID")" 2>/dev/null
-    nohup ssh "${SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
-      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-      -L "127.0.0.1:$PROXY_PORT:127.0.0.1:$PROXY_PORT" "$MAC_SSH" >"$CACHE_DIR/proxy-tunnel.log" 2>&1 &
+    nohup ssh "${TUN_OPTS[@]}" -L "127.0.0.1:$PROXY_PORT:127.0.0.1:$PROXY_PORT" "$MAC_SSH" \
+      >"$CACHE_DIR/proxy-tunnel.log" 2>&1 &
     echo $! >"$PROXY_PID"
-    local _; for _ in 1 2 3 4 5 6 7 8 9 10; do curl -fs -m 1 -o /dev/null "$url/health" && break; sleep 0.5; done
-    pid_alive "$PROXY_PID" || { cat "$CACHE_DIR/proxy-tunnel.log" >&2; die "could not open the SSH tunnel to the proxy (local port $PROXY_PORT busy?)"; }
-    curl -fs -m 2 -o /dev/null "$url/health" \
-      || die "the proxy is not answering on the Mac yet (it can take ~15 s after setup or a restart); see ~/.macsim/logs/proxy.log there"
+    local _; for _ in 1 2 3 4 5 6 7 8 9 10; do curl -fs -m 1 -o /dev/null "$url/health" && { echo "$url"; return; }; sleep 0.5; done
+    # A parallel caller (agents often run several ios-device commands at once) may own the
+    # tunnel while ours lost the port race, so only fail when the proxy is really unreachable.
+    curl -fs -m 2 -o /dev/null "$url/health" && { echo "$url"; return; }
+    if ! pid_alive "$PROXY_PID"; then
+      ssh "${SSH_OPTS[@]}" "$MAC_SSH" true 2>/dev/null || offline
+      cat "$CACHE_DIR/proxy-tunnel.log" >&2; die "could not open the SSH tunnel to the proxy (local port $PROXY_PORT busy?)"
+    fi
+    die "the proxy is not answering on the Mac yet (it can take ~15 s after setup or a restart); see ~/.macsim/logs/proxy.log there"
   fi
   echo "$url"
 }
@@ -161,16 +177,33 @@ cmd_sync() {
   local ex=(--exclude=.git/ --exclude=node_modules/ --exclude=.expo/ --exclude=/android/
             --exclude=/build/ --exclude=/ios/build/ --exclude=/ios/Pods/ --exclude=/Pods/
             --exclude=DerivedData/ --exclude=.DS_Store --exclude=xcuserdata/
-            --exclude=.macsim-deps --exclude=.macsim-pods --exclude=.venv/ --exclude=.gradle/)
+            --exclude=.macsim-deps --exclude=.macsim-pods --exclude=.macsim-prebuild --exclude=.venv/ --exclude=.gradle/
+            --exclude=.xcode.env.local)  # holds this machine's NODE_BINARY path; the Mac writes its own
   # CNG Expo projects: ios/ only exists on the Mac (generated), so don't let --delete wipe it.
   [ -d "$root/ios" ] || ex+=(--exclude=/ios/)
+  # CocoaPods output this machine doesn't have (pod install never runs here): keep the Mac's.
+  local d; for d in "" ios/; do
+    [ -f "$root/${d}Podfile" ] || continue
+    compgen -G "$root/${d}*.xcworkspace" >/dev/null || ex+=(--exclude="/${d}*.xcworkspace/")
+    [ -f "$root/${d}Podfile.lock" ] || ex+=(--exclude="/${d}Podfile.lock")
+  done
   # XcodeGen: the .xcodeproj is generated on the Mac; protect it from --delete.
   if [ -f "$root/project.yml" ] && ! compgen -G "$root/*.xcodeproj" >/dev/null; then ex+=(--exclude='/*.xcodeproj/'); fi
   if [ -f "$root/ios/project.yml" ] && ! compgen -G "$root/ios/*.xcodeproj" >/dev/null; then ex+=(--exclude='/ios/*.xcodeproj/'); fi
-  # Respect .gitignore files at any depth: keeps build junk, caches and artifacts off the Mac.
-  [ -f "$root/.gitignore" ] && ex+=(--filter=':- .gitignore')
-  [ -f "$root/.macsimignore" ] && ex+=(--exclude-from="$root/.macsimignore")
-  local dest; dest="$(r prepare "$name")" || exit 1
+  # Respect .gitignore files at any depth (also nested ones when the root has none): keeps build
+  # junk, caches and artifacts off the Mac. rsync doesn't understand gitignore's "!pattern".
+  ex+=(--filter=':- .gitignore')
+  # .macsimignore: one pattern per line excludes more; "!pattern" syncs something gitignored anyway
+  # (e.g. !GoogleService-Info.plist). Includes go first, since the first matching rule wins.
+  if [ -f "$root/.macsimignore" ]; then
+    local l inc=()
+    while IFS= read -r l || [ -n "$l" ]; do
+      l="${l%$'\r'}"
+      case "$l" in ''|'#'*) ;; '!'*) inc+=(--include="${l#!}") ;; *) ex+=(--exclude="$l") ;; esac
+    done <"$root/.macsimignore"
+    ex=(${inc[@]+"${inc[@]}"} "${ex[@]}")
+  fi
+  local dest; dest="$(r prepare "$name")" || exit $?
   [ ${#dry[@]} -eq 0 ] && info "sync $root -> mac:$dest"
   # shellcheck disable=SC2016  # $PATH must expand on the Mac
   rsync -az --delete "${dry[@]}" "${ex[@]}" \
@@ -188,36 +221,41 @@ with_lock() { # with_lock NAME: serialize builds of one project (best effort wit
 }
 
 cmd_build() {
-  local path="" type="" pass=() launch=1 has_device=0
+  local path="" type="" pass=() launch=1 has_device=0 prebuild=0 config=Debug
   while [ $# -gt 0 ]; do case "$1" in
     --type) type="$2"; shift 2 ;;
     --device) pass+=("$1" "$2"); has_device=1; shift 2 ;;
-    --scheme|--configuration) pass+=("$1" "$2"); shift 2 ;;
-    --prebuild) pass+=("$1"); shift ;;
+    --scheme) pass+=("$1" "$2"); shift 2 ;;
+    --configuration) pass+=("$1" "$2"); config="$2"; shift 2 ;;
+    --prebuild) pass+=("$1"); prebuild=1; shift ;;
     --no-launch) pass+=("$1"); launch=0; shift ;;
     -*) die "unknown option $1" ;;
     *) path="$1"; shift ;; esac; done
   [ -n "$DEVICE" ] && [ $has_device = 0 ] && pass+=(--device "$DEVICE")
   local root name; root="$(proj_root "$path")"; name="$(proj_name "$root")"
   [ -n "$type" ] || type="$(proj_type "$root")" || exit 1
+  case "$type" in expo|rn|xcode) ;; *) die "unknown --type $type (expo|rn|xcode)" ;; esac
+  [ $prebuild = 1 ] && [ "$type" != expo ] && die "--prebuild is for Expo projects (this one is: $type)"
+  # CNG: ios/ lives only on the Mac, so let it re-run prebuild when the app config changes.
+  [ "$type" = expo ] && [ ! -d "$root/ios" ] && pass+=(--cng)
   with_lock "$name"
 
   if [ "$type" != xcode ]; then
     if metro_running; then tunnel_start >/dev/null
     else info "Metro is not running on port $METRO_PORT here. Start it (e.g. 'npx expo start'), then 'macsim tunnel start'."; fi
   fi
-  cmd_sync "$root" >/dev/null || exit 1
+  cmd_sync "$root" >/dev/null || exit $?
   local out rc
   case "$type" in
     expo)  out="$(r build-expo "$name" "${pass[@]}")"; rc=$? ;;
     rn|xcode) out="$(r build-xcode "$name" "${pass[@]}")"; rc=$? ;;
-    *) die "unknown --type $type" ;;
   esac
   [ $rc -eq 0 ] || exit $rc
   echo "$out"
-  local bid; bid="$(sed -n 's/^BUNDLE_ID=//p' <<<"$out")"
-  if [ "$type" = expo ] && [ $launch = 1 ] && has_dep "$root" expo-dev-client; then
-    cmd_dev_client "$root" >/dev/null && info "dev client pointed at Metro on this machine"
+  local bid udid; bid="$(sed -n 's/^BUNDLE_ID=//p' <<<"$out")"; udid="$(sed -n 's/^UDID=//p' <<<"$out")"
+  # Only Debug builds contain the dev client; Release bundles its JS.
+  if [ "$type" = expo ] && [ $launch = 1 ] && [ "$config" = Debug ] && has_dep "$root" expo-dev-client; then
+    cmd_dev_client "$root" "$udid" >/dev/null && info "dev client pointed at Metro on this machine"
   fi
   echo "PROJECT=$name"
   [ -n "$bid" ] && echo "next: ios-device open $bid --platform ios   (UI automation)"
@@ -228,12 +266,12 @@ expo_cfg() { # prints the Expo public config as JSON
     || node -e 'const j=require(process.argv[1]);console.log(JSON.stringify(j.expo||j))' "$1/app.json" 2>/dev/null
 }
 
-cmd_dev_client() {
-  local root; root="$(proj_root "${1:-}")"
+cmd_dev_client() { # cmd_dev_client [PATH] [DEVICE]
+  local root device="${2:-$DEVICE}"; root="$(proj_root "${1:-}")"
   local slug; slug="$(expo_cfg "$root" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).slug||""))')"
   [ -n "$slug" ] || die "could not read the Expo slug"
   tunnel_start >/dev/null
-  r openurl "exp+$slug://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A$METRO_PORT" ${DEVICE:+"$DEVICE"}
+  r openurl "exp+$slug://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A$METRO_PORT" ${device:+"$device"}
 }
 
 cmd_expo_go() {
@@ -242,7 +280,7 @@ cmd_expo_go() {
   [ -n "$ver" ] || die "can't determine the Expo SDK version"
   local url; url="$(curl -fsSL https://api.expo.dev/v2/versions/latest | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const s=JSON.parse(d).data.sdkVersions[process.argv[1]+".0.0"];console.log(s&&s.iosClientUrl||"")})' "$ver")"
   [ -n "$url" ] || die "no Expo Go simulator build for SDK $ver"
-  r expo-go "$url" "$DEVICE" || exit 1
+  r expo-go "$url" "$DEVICE" || exit $?
   metro_running || info "Metro is not running here. Start 'npx expo start' first."
   tunnel_start >/dev/null
   r openurl "exp://127.0.0.1:$METRO_PORT" ${DEVICE:+"$DEVICE"}
@@ -254,18 +292,26 @@ tun_pid() { echo "$CACHE_DIR/tunnel.$METRO_PORT.pid"; }
 
 tunnel_start() {
   if pid_alive "$(tun_pid)"; then echo "tunnel already running (pid $(cat "$(tun_pid)"))"; return 0; fi
-  nohup ssh "${SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
-    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-    -R "127.0.0.1:$METRO_PORT:localhost:$METRO_PORT" "$MAC_SSH" >"$CACHE_DIR/tunnel.log" 2>&1 &
-  echo $! >"$(tun_pid)"
-  sleep 1.5
-  if pid_alive "$(tun_pid)"; then echo "tunnel up: Mac 127.0.0.1:$METRO_PORT -> localhost:$METRO_PORT here"
-  else
-    rm -f "$(tun_pid)"
-    grep -q "remote port forwarding failed" "$CACHE_DIR/tunnel.log" \
-      && die "port $METRO_PORT is already taken on the Mac (Metro running there?)"
-    offline
+  local logf="$CACHE_DIR/tunnel.$METRO_PORT.log" mac_port="nc -z 127.0.0.1 $METRO_PORT 2>/dev/null"
+  # Check first: once our forward is up, a listener on that port can't be told apart from it.
+  if ssh "${SSH_OPTS[@]}" "$MAC_SSH" "$mac_port"; then
+    die "port $METRO_PORT is already taken on the Mac (Metro running there, or a tunnel from another machine?)"
   fi
+  nohup ssh "${TUN_OPTS[@]}" -R "127.0.0.1:$METRO_PORT:localhost:$METRO_PORT" "$MAC_SSH" >"$logf" 2>&1 &
+  echo $! >"$(tun_pid)"
+  # The tunnel has its own (non-multiplexed) connection, so wait until the Mac end really listens.
+  local _; for _ in $(seq 20); do
+    pid_alive "$(tun_pid)" || break
+    if ssh "${SSH_OPTS[@]}" "$MAC_SSH" "$mac_port"; then
+      echo "tunnel up: Mac 127.0.0.1:$METRO_PORT -> localhost:$METRO_PORT here"; return 0
+    fi
+    sleep 0.5
+  done
+  pid_alive "$(tun_pid)" && kill "$(cat "$(tun_pid)")"
+  rm -f "$(tun_pid)"
+  grep -q "remote port forwarding failed" "$logf" \
+    && die "port $METRO_PORT is already taken on the Mac (Metro running there?)"
+  cat "$logf" >&2; offline
 }
 tunnel_stop() {
   if pid_alive "$(tun_pid)"; then kill "$(cat "$(tun_pid)")"; echo "tunnel stopped"; else echo "tunnel not running"; fi
@@ -283,12 +329,16 @@ cmd_view() {
       pid_alive "$VIEW_PID" && kill "$(cat "$VIEW_PID")"; rm -f "$VIEW_PID"
       r view stop ;;
     start)
-      local out; out="$(r view start ${DEVICE:+"$DEVICE"})" || exit 1
+      local out; out="$(r view start ${DEVICE:+"$DEVICE"})" || exit $?
       port="$(sed -n 's/^VIEW_PORT=//p' <<<"$out")"
       if ! pid_alive "$VIEW_PID"; then
-        nohup ssh "${SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none \
-          -o ServerAliveInterval=15 -L "127.0.0.1:$port:127.0.0.1:$port" "$MAC_SSH" >"$CACHE_DIR/view.log" 2>&1 &
-        echo $! >"$VIEW_PID"; sleep 1.5
+        nohup ssh "${TUN_OPTS[@]}" -L "127.0.0.1:$port:127.0.0.1:$port" "$MAC_SSH" >"$CACHE_DIR/view.log" 2>&1 &
+        echo $! >"$VIEW_PID"
+        local _; for _ in $(seq 20); do
+          pid_alive "$VIEW_PID" || break
+          curl -fs -m 1 -o /dev/null "http://127.0.0.1:$port/" && break
+          sleep 0.5
+        done
         pid_alive "$VIEW_PID" || { rm -f "$VIEW_PID"; cat "$CACHE_DIR/view.log" >&2; die "could not forward port $port (busy here?)"; }
       fi
       echo "preview: http://localhost:$port"
@@ -302,16 +352,19 @@ cmd_view() {
 cmd_install() {
   local file="${1:-}"; shift || true
   [ -e "$file" ] || die "usage: macsim install FILE [--launch]"
-  local dir; dir="$(r artifacts-dir)" || exit 1
+  # "Foo.app/" would make rsync copy the bundle's contents instead of the bundle.
+  while [ "${file%/}" != "$file" ] && [ "$file" != / ]; do file="${file%/}"; done
+  local dir; dir="$(r artifacts-dir)" || exit $?
   rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "$file" "$MAC_SSH:$dir/" || die "upload failed"
   r install "$dir/$(basename "$file")" ${DEVICE:+--device "$DEVICE"} "$@"
 }
 
 cmd_screenshot() {
-  local out="${1:-$PWD/sim-$(date +%H%M%S).png}" tmp="/tmp/macsim-shot-$$.png"
-  r screenshot "$tmp" >/dev/null || exit 1
-  scp -q "${SSH_OPTS[@]}" "$MAC_SSH:$tmp" "$out" && ssh "${SSH_OPTS[@]}" "$MAC_SSH" "rm -f $tmp"
-  echo "$out"
+  local out="${1:-$PWD/sim-$(date +%H%M%S).png}"
+  mkdir -p "$(dirname "$out")" || exit 1
+  # The PNG comes back on stdout: one round trip, nothing left behind on the Mac.
+  r screenshot ${DEVICE:+"$DEVICE"} >"$out.part" && [ -s "$out.part" ] || { rm -f "$out.part"; die "screenshot failed"; }
+  mv "$out.part" "$out" && echo "$out"
 }
 
 cmd_status() {
@@ -434,9 +487,12 @@ cmd_uninstall() {
   else
     info "Mac unreachable: skipped the Mac side. Later, on the Mac: bash ~/.macsim/bin/macsim-remote uninstall"
   fi
+  ssh "${SSH_OPTS[@]}" -O exit "$MAC_SSH" >/dev/null 2>&1
   if [ -f ~/.ssh/config ] && grep -q '^# added by macsim$' ~/.ssh/config; then
     cp ~/.ssh/config ~/.ssh/config.bak-macsim
-    awk '/^# added by macsim$/{skip=1; next} skip && /^[[:space:]]*$/{skip=0; next} !skip' ~/.ssh/config.bak-macsim >~/.ssh/config
+    # The block ends at a blank line, or at the next Host/Match if someone appended one right after it.
+    awk -v h="Host $MAC_SSH" '/^# added by macsim$/{skip=1; next} skip && /^[[:space:]]*$/{skip=0; next}
+         skip && /^(Host|Match)[[:space:]]/ && $0 != h {skip=0} !skip' ~/.ssh/config.bak-macsim >~/.ssh/config
     info "removed the macsim block from ~/.ssh/config (backup: ~/.ssh/config.bak-macsim)"
   fi
   if [ -f ~/.ssh/authorized_keys ] && grep -q '@mac-macsim$' ~/.ssh/authorized_keys; then

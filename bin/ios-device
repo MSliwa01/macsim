@@ -18,14 +18,22 @@ case "${1:-}" in
   ""|help|--help|-h|--version) exec agent-device "$@" ;;
 esac
 
-url="$(macsim _proxy-url)" || exit 1
+url="$(macsim _proxy-url)" || exit $?
 marker="$AGENT_DEVICE_STATE_DIR/.macsim-url"
 if [ "${1:-}" = reconnect ] || [ ! -d "$AGENT_DEVICE_STATE_DIR/remote-connections" ] || [ "$(cat "$marker" 2>/dev/null)" != "$url" ]; then
   mkdir -p "$AGENT_DEVICE_STATE_DIR"
-  agent-device connect proxy --force --daemon-base-url "$url/agent-device" \
-    --daemon-auth-token "$AGENT_DEVICE_DAEMON_AUTH_TOKEN" >/dev/null || exit 1
+  # Release the old connection's lease first. Otherwise its session keeps the simulator, and the
+  # new connection can neither close it nor `open` (DEVICE_IN_USE).
+  if [ -d "$AGENT_DEVICE_STATE_DIR/remote-connections" ]; then
+    if command -v timeout >/dev/null; then timeout 8 agent-device disconnect >/dev/null 2>&1
+    else agent-device disconnect >/dev/null 2>&1; fi
+    # disconnect leaves the connection file behind; without this one piles up per reconnect.
+    rm -f "$AGENT_DEVICE_STATE_DIR"/remote-connections/*.json
+  fi
+  # The token comes from the environment, not argv, so other users can't read it in ps.
+  agent-device connect proxy --force --daemon-base-url "$url/agent-device" >/dev/null || exit 1
   echo "$url" >"$marker"
-  [ "${1:-}" = reconnect ] && { echo "connected to $url"; exit 0; }
+  [ "${1:-}" = reconnect ] && { echo "connected to $url (new session: run 'ios-device open <bundle-id> --platform ios')"; exit 0; }
 fi
 
 if [ "${1:-}" = open ]; then

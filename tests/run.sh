@@ -11,7 +11,7 @@ mkdir -p "$T/bin" "$T/mac" "$T/client/.ssh" "$T/cfg/macsim"
 cat >"$T/bin/ssh" <<'SH'
 #!/usr/bin/env bash
 # fake ssh: drop options and the host, run the command in the fake Mac HOME
-while [ $# -gt 0 ]; do case "$1" in -o|-i|-p|-R|-L|-S|-F) shift 2 ;; -*) shift ;; *) break ;; esac; done
+while [ $# -gt 0 ]; do case "$1" in -O) exit 0 ;; -o|-i|-p|-R|-L|-S|-F) shift 2 ;; -*) shift ;; *) break ;; esac; done
 shift
 cd "$FAKE_MAC" && HOME="$FAKE_MAC" PATH="$FAKE_BIN:$PATH" exec bash -c "$*"
 SH
@@ -82,6 +82,73 @@ echo n >"$bare/ios/New.swift"
 check "dry run lists pending changes"   bash -c "'$M' sync '$bare' --dry-run 2>/dev/null | grep -q 'ios/New.swift'"
 check "dry run does not copy"           test ! -e "$s2/ios/New.swift"
 check "project names are stable" test "$("$M" sync "$cng" 2>/dev/null)" = "$n"
+echo 'export NODE_BINARY=/home/me/.nvm/node' >"$bare/ios/.xcode.env.local"; "$M" sync "$bare" >/dev/null 2>&1
+check "client .xcode.env.local is not synced"   test ! -e "$s2/ios/.xcode.env.local"
+check "bad --type is rejected before syncing"   bash -c "'$M' build '$swift' --type bogus 2>&1 | grep -q 'unknown --type bogus'"
+check "--prebuild is rejected for non-Expo"     bash -c "'$M' build '$swift' --prebuild 2>&1 | grep -q 'prebuild is for Expo'"
+# bare RN made on Linux: no workspace / Podfile.lock here, so the Mac's must survive a resync
+mkdir -p "$s2/ios/App.xcworkspace"; echo L >"$s2/ios/Podfile.lock"; "$M" sync "$bare" >/dev/null 2>&1
+check "Pods workspace made on the Mac survives resync" test -d "$s2/ios/App.xcworkspace"
+check "Podfile.lock made on the Mac survives resync"   test -f "$s2/ios/Podfile.lock"
+# nested .gitignore without a root one; "!pattern" in .macsimignore brings back a gitignored file
+mkdir -p "$swift/Sub/junk"; echo j >"$swift/Sub/junk/x"; echo g >"$swift/Sub/GoogleService-Info.plist"
+printf 'junk/\nGoogleService-Info.plist\n' >"$swift/Sub/.gitignore"
+printf '# comment\n!GoogleService-Info.plist\nextra.txt\n' >"$swift/.macsimignore"; echo e >"$swift/extra.txt"
+n5="$("$M" sync "$swift" 2>/dev/null)"; s5="$FAKE_MAC/.macsim/builds/$n5/src"
+check "nested .gitignore honoured without a root one"    test ! -e "$s5/Sub/junk"
+check ".macsimignore '!pattern' syncs a gitignored file" test -f "$s5/Sub/GoogleService-Info.plist"
+check ".macsimignore pattern excludes"                   test ! -e "$s5/extra.txt"
+rm -rf "$swift/Sub" "$swift/.macsimignore" "$swift/extra.txt" "$FAKE_MAC/.macsim/builds/$n5"
+
+# ---- simulator commands (simctl stubbed with one booted iPhone)
+stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$T/bin/$1"; chmod +x "$T/bin/$1"; }
+stub open 'exit 0'
+stub xcrun 'case "$*" in
+  "simctl list devices available -j") echo "{\"devices\":{\"com.apple.CoreSimulator.SimRuntime.iOS-27-0\":[
+    {\"udid\":\"U2\",\"state\":\"Shutdown\",\"name\":\"iPhone 17\"},{\"udid\":\"U1\",\"state\":\"Booted\",\"name\":\"iPhone 17\"}]}}" ;;
+  "simctl io U1 screenshot --type=png "*) printf PNGDATA >"${@: -1}" ;;
+  *) exit 1 ;;
+esac'
+"$M" screenshot "$T/shot.png" >/dev/null 2>&1
+check "screenshot: PNG streamed back"            test "$(cat "$T/shot.png" 2>/dev/null)" = PNGDATA
+check "screenshot: no temp file left behind"     test -z "$(ls "${TMPDIR:-/tmp}"/macsim-shot.* 2>/dev/null)"
+check "device by name prefers the booted one"    test "$("$M" boot 'iPhone 17' 2>/dev/null)" = U1
+stub xcrun 'exit 1'
+check "screenshot: failure is reported"          bash -c "! '$M' screenshot '$T/bad.png' 2>/dev/null && test ! -e '$T/bad.png'"
+printf '#!/bin/sh\nexit 0\n' >"$T/bin/xcrun"
+
+# ---- Mac-side build helpers (sourced from macsim-remote)
+R="$ROOT/mac/bin/macsim-remote"
+rfn() { sed -n "/^$1()/,/^}/p" "$R"; }
+# shellcheck disable=SC2034,SC2329  # LOGDIR/SRC/log/die are used by the eval'd functions
+(
+  eval "$(rfn summarize_failure)"; eval "$(rfn pods_install)"; eval "$(rfn pods_inputs)"
+  log() { :; }; die() { echo "$*" >&2; exit 1; }
+  w="$T/podproj"; mkdir -p "$w/ios"; LOGDIR="$w"; SRC="$w"
+  printf '/x/src/App/A.swift:3:1: error: boom\n' >"$w/b.log"
+  sf="$(SRC=/x/src summarize_failure "$w/b.log" 2>&1)"
+  grep -qx 'App/A.swift:3:1: error: boom' <<<"$sf" && echo "ok   build errors use project-relative paths" || echo "FAIL build errors use project-relative paths"
+  stub pod 'echo run >>../pod-runs; mkdir -p Pods App.xcworkspace; echo L1 >Podfile.lock; cp Podfile.lock Pods/Manifest.lock'
+  echo pf >"$w/ios/Podfile"; echo L0 >"$w/ios/Podfile.lock"; echo D1 >"$w/.macsim-deps"
+  pods_install "$w/ios"
+  echo L0 >"$w/ios/Podfile.lock"; pods_install "$w/ios"   # client re-synced its older lock
+  [ "$(wc -l <"$w/pod-runs")" = 1 ] && echo "ok   pods: stale client Podfile.lock does not re-run pod install" || echo "FAIL pods: stale client Podfile.lock does not re-run pod install"
+  cmp -s "$w/ios/Podfile.lock" "$w/ios/Pods/Manifest.lock" && echo "ok   pods: Podfile.lock matches Manifest.lock" || echo "FAIL pods: Podfile.lock matches Manifest.lock"
+  echo D2 >"$w/.macsim-deps"; pods_install "$w/ios"          # new native JS dependency
+  [ "$(wc -l <"$w/pod-runs")" = 2 ] && echo "ok   pods: JS dependency change re-runs pod install" || echo "FAIL pods: JS dependency change re-runs pod install"
+  eval "$(rfn prebuild_output_hash)"
+  mkdir -p "$w/pb/A.xcodeproj"; printf 'a = 0123456789ABCDEF01234567 /* x */;\nb = 89ABCDEF0123456789ABCDEF /* y */;\n' >"$w/pb/A.xcodeproj/project.pbxproj"
+  h1="$(prebuild_output_hash "$w/pb")"
+  printf 'b = 1111111111AAAAAAAAAA2222 /* y */;\na = 3333333333BBBBBBBBBB4444 /* x */;\n' >"$w/pb/A.xcodeproj/project.pbxproj"
+  mkdir -p "$w/pb/Pods"; echo x >"$w/pb/Pods/junk"
+  [ "$h1" = "$(prebuild_output_hash "$w/pb")" ] && echo "ok   prebuild output: random pbxproj IDs and Pods ignored" || echo "FAIL prebuild output: random pbxproj IDs and Pods ignored"
+  echo 'c = 1;' >>"$w/pb/A.xcodeproj/project.pbxproj"
+  [ "$h1" != "$(prebuild_output_hash "$w/pb")" ] && echo "ok   prebuild output: a real pbxproj change is noticed" || echo "FAIL prebuild output: a real pbxproj change is noticed"
+  rm -rf "$w/ios/App.xcworkspace"; pods_install "$w/ios"
+  [ "$(wc -l <"$w/pod-runs")" = 3 ] && echo "ok   pods: missing workspace re-runs pod install" || echo "FAIL pods: missing workspace re-runs pod install"
+) >"$T/helpers.log" 2>&1
+pass=$((pass + $(grep -c '^ok' "$T/helpers.log"))); fail=$((fail + $(grep -c '^FAIL' "$T/helpers.log")))
+cat "$T/helpers.log"
 
 # ---- clean
 "$M" clean "$n2" >/dev/null 2>&1
@@ -95,7 +162,7 @@ check "legacy ~/builds is kept for old installs" test -d "$FAKE_MAC/builds/$n4/s
 rm -rf "$FAKE_MAC/builds"
 
 # ---- uninstall (both sides)
-printf 'Host other\n    HostName x\n\n# added by macsim\nHost testmac\n    HostName fake\n\nHost after\n    HostName y\n' >"$HOME/.ssh/config"
+printf 'Host other\n    HostName x\n\n# added by macsim\nHost testmac\n    HostName fake\nHost glued\n    HostName z\n\nHost after\n    HostName y\n' >"$HOME/.ssh/config"
 printf 'Host keep\n    HostName k\n\n# added by macsim\nHost pc\n    HostName 1.2.3.4\n\n' >"$FAKE_MAC/.ssh_config"
 mkdir -p "$FAKE_MAC/.ssh"; mv "$FAKE_MAC/.ssh_config" "$FAKE_MAC/.ssh/config"
 # shellcheck disable=SC2016  # literal rc-file line
@@ -105,7 +172,7 @@ printf 'ssh-ed25519 AAAA me@laptop\nssh-ed25519 BBBB u@mac-macsim\n' >"$HOME/.ss
 check "uninstall: ~/.macsim removed on the Mac"   test ! -e "$FAKE_MAC/.macsim"
 check "uninstall: Mac PATH line removed"          bash -c "! grep -q macsim '$FAKE_MAC/.zshrc' && grep -q 'echo hi' '$FAKE_MAC/.zshrc'"
 check "uninstall: Mac 'Host pc' block removed"    bash -c "! grep -q 'Host pc' '$FAKE_MAC/.ssh/config' && grep -q 'Host keep' '$FAKE_MAC/.ssh/config'"
-check "uninstall: client Host block removed"      bash -c "! grep -q testmac '$HOME/.ssh/config' && grep -q 'Host other' '$HOME/.ssh/config' && grep -q 'Host after' '$HOME/.ssh/config'"
+check "uninstall: client Host block removed"      bash -c "! grep -q testmac '$HOME/.ssh/config' && grep -q 'Host other' '$HOME/.ssh/config' && grep -q 'Host after' '$HOME/.ssh/config' && grep -q 'Host glued' '$HOME/.ssh/config'"
 check "uninstall: Mac key removed, others kept"   bash -c "! grep -q mac-macsim '$HOME/.ssh/authorized_keys' && grep -q me@laptop '$HOME/.ssh/authorized_keys'"
 check "uninstall: client config removed"          test ! -e "$T/cfg/macsim"
 
@@ -113,7 +180,6 @@ check "uninstall: client config removed"          test ! -e "$T/cfg/macsim"
 rm -rf "$FAKE_MAC" "$T/cfg/macsim" "$T/cache"; mkdir -p "$FAKE_MAC" "$HOME/.ssh"
 printf 'Host existing\n    HostName e\n' >"$HOME/.ssh/config"; : >"$HOME/.ssh/authorized_keys"
 ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
-stub() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$T/bin/$1"; chmod +x "$T/bin/$1"; }
 stub ssh-copy-id 'exit 0'
 stub scp 'for a; do :; done; src="${@: -2:1}"; dst="${@: -1}"; cp "$src" "$FAKE_MAC/${dst#*:}"'
 stub agent-device 'echo 0.20.10'

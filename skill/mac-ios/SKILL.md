@@ -34,7 +34,7 @@ Metro runs **on this machine**. The simulator reaches it through a reverse SSH t
 2. `macsim tunnel start`. `macsim build` does this automatically when Metro is up.
 3. Pick the native shell:
    - Only Expo SDK modules: `macsim expo-go` installs the matching Expo Go and opens the project. No native build. Experimental.
-   - `expo-dev-client` or custom native code: `macsim build` once. Rebuild only when native deps, config plugins, or `ios/` change; use `macsim build --prebuild` after config-plugin changes. Afterwards, `macsim dev-client` reconnects the app to Metro.
+   - `expo-dev-client` or custom native code: `macsim build` once. Rebuild only when native deps, the app config, config plugins, or `ios/` change; macsim prebuilds again by itself when `app.json`/`app.config.*`, `plugins/` or dependencies change, and `macsim build --prebuild` forces a clean prebuild. Afterwards, `macsim dev-client` reconnects the app to Metro.
    - Prebuilt simulator artifact (e.g. EAS `"ios": {"simulator": true}`): `macsim install build.tar.gz --launch`.
 4. JS edits hot-reload by themselves. Do not rebuild for JS-only changes.
 
@@ -60,7 +60,7 @@ ios-device close                                            # always close: rele
 - Leases expire after 5 idle minutes. "Device busy" means another agent holds it: wait or ask, don't force.
 - Parallel agents: each one passes its own `--session <name>` on every command.
 - Bare React Native: add `--metro-host 127.0.0.1 --metro-port <port>` to `open`.
-- Auth or session errors: run `ios-device reconnect`, then retry once.
+- Auth or session errors: run `ios-device reconnect`, then `ios-device open <BUNDLE_ID> --platform ios` again (reconnect starts a new session) and retry once.
 - Quick look without a session: `macsim screenshot out.png`. Deep link: `macsim open-url 'myapp://path'`. Relaunch: `macsim launch <BUNDLE_ID>`.
 - `macsim view` opens a live preview in the user's browser. Offer it when they want to watch; you still drive the UI with `ios-device`.
 

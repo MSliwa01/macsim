@@ -86,7 +86,7 @@ macsim view                       # watch the simulator in your browser
 | `macsim install FILE --launch` | Installs a simulator `.app` / `.tar.gz` / `.zip`, e.g. an EAS simulator build. |
 | `macsim view` | Opens the live simulator in your browser via [serve-sim](https://github.com/EvanBacon/serve-sim) on `localhost:3200`. `macsim view stop` stops it. |
 | `macsim screenshot`, `launch`, `open-url`, `devices`, `boot`, `shutdown` | Take a screenshot, launch an app, open a deep link, and list, boot or shut down simulators. |
-| `ios-device …` | `agent-device`, connected to the Mac's simulator. `ios-device reconnect` re-creates the proxy connection. |
+| `ios-device …` | `agent-device`, connected to the Mac's simulator. `ios-device reconnect` re-creates the proxy connection (then `ios-device open` again). |
 | `macsim list` / `macsim clean …` | Shows / prunes per-project caches on the Mac. |
 | `macsim ssh [CMD]` | Shell on the Mac with the macsim environment. |
 
@@ -106,7 +106,7 @@ Run `macsim help` for everything.
 
 1. Start Metro on your machine: `npx expo start`.
 2. Run `macsim build` once. It creates the reverse tunnel when Metro is up, prebuilds (CNG), runs `pod install`, builds with `xcodebuild` and opens the dev client against your Metro.
-3. Hot reload of JS edits goes through the tunnel. Rebuild only when native code, native dependencies or config plugins change (`macsim build --prebuild` after plugin changes).
+3. Hot reload of JS edits goes through the tunnel. Rebuild only when native code, native dependencies or the app config change. macsim notices changes to `app.json`/`app.config.*`, `plugins/` and dependencies and prebuilds again; `macsim build --prebuild` forces a clean prebuild (e.g. after editing a plugin that lives elsewhere).
 
 Builds use plain `xcodebuild`, not `expo run:ios`. That avoids AppleScript and window activation (which fail over SSH) and keeps DerivedData inside the project's build dir.
 
@@ -124,8 +124,9 @@ Install the skill with `./install.sh --skill`. It links `skill/mac-ios` into `~/
 
 ## How it works
 
-- **Sync.** Each project gets `~/.macsim/builds/<name>-<hash>/{src,dd,logs}` on the Mac. `rsync --delete` skips `.git`, `node_modules`, `Pods`, build output, anything in your `.gitignore` files, and anything in an optional `.macsimignore`. Files generated on the Mac (`ios/` from Expo prebuild, `*.xcodeproj` from XcodeGen, `node_modules`, `Pods`) are protected from deletion, so builds stay incremental.
-- **Build.** macsim reinstalls JS deps only when the lockfile or `package.json` changes, and Pods only when the Podfile or its lockfile changes. XcodeGen runs with `--use-cache`. Then `xcodebuild` builds for the simulator and `simctl` installs the app.
+- **Sync.** Each project gets `~/.macsim/builds/<name>-<hash>/{src,dd,logs}` on the Mac. `rsync --delete` skips `.git`, `node_modules`, `Pods`, build output, anything in your `.gitignore` files, and anything in an optional `.macsimignore`. Files generated on the Mac (`ios/` from Expo prebuild, `*.xcodeproj` from XcodeGen, `node_modules`, `Pods`, and the Pods `*.xcworkspace` / `Podfile.lock` when your checkout has none) are protected from deletion, so builds stay incremental.
+- **`.macsimignore`.** One pattern per line (rsync syntax, `#` comments). A `!pattern` line syncs something your `.gitignore` excludes, e.g. `!GoogleService-Info.plist`; for a file inside an ignored directory, also add that directory (`!secrets/`). rsync doesn't understand gitignore's own `!` negations, so files kept that way also need a `!` line here.
+- **Build.** macsim reinstalls JS deps only when the lockfile, `package.json`, `patches/` or the package manager config changes, and Pods only when the Podfile, its lockfile or the JS deps change. For Expo CNG projects it re-runs `expo prebuild` when `app.json`/`app.config.*`, `plugins/` or the deps change; if the generated native project comes out the same, the existing `ios/` (with its Pods) is kept, so such a rebuild takes seconds instead of minutes. XcodeGen regenerates the project on every build (well under a second). Then `xcodebuild` builds for the simulator, and `simctl` installs the app unless the same build is already installed.
 - **UI automation.** A LaunchAgent on the Mac runs `agent-device proxy`, protected by a random token. `ios-device` connects to it through an SSH tunnel (default) or directly (`--direct`), using its own agent-device state dir so a local `agent-device` keeps working.
 - **Updates.** The client hashes `mac/` and re-uploads the Mac-side scripts automatically when they change. After `git pull` there's nothing to do on the Mac.
 
@@ -176,7 +177,7 @@ Files macsim touches outside the repo:
 
 ```bash
 macsim uninstall            # Mac: LaunchAgent, ~/.macsim, builds, PATH line, Host pc; here: config, cache, SSH block
-macsim uninstall --keep-builds
+macsim uninstall --keep-builds   # builds under ~/.macsim are moved to ~/macsim-builds on the Mac
 ./install.sh --uninstall    # remove the macsim / ios-device links and the skill
 ```
 

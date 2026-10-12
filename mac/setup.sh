@@ -159,6 +159,7 @@ Host pc
     ControlPath ~/.ssh/cm/%r@%h:%p
     ControlPersist 10m
     ServerAliveInterval 15
+
 EOF
     echo "added 'Host pc' ($PC_USER@$PC_HOST) to ~/.ssh/config"
   fi
