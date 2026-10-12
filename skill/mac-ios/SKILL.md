@@ -57,7 +57,7 @@ ios-device close                                            # always close: rele
 ```
 
 - The first `open` after a Mac restart or agent-device upgrade can take 1–2 min while the XCUITest runner builds. It is not a hang.
-- Leases expire after 5 idle minutes. "Device busy" means another agent holds it: wait or ask, don't force.
+- Leases expire after 5 idle minutes. "Device busy" / `DEVICE_IN_USE` means another agent holds it: wait or ask, don't force. If you are sure no other agent is working (e.g. a session left behind by an earlier, crashed run), `macsim restart` clears all sessions on the Mac.
 - Parallel agents: each one passes its own `--session <name>` on every command.
 - Bare React Native: add `--metro-host 127.0.0.1 --metro-port <port>` to `open`.
 - Auth or session errors: run `ios-device reconnect`, then `ios-device open <BUNDLE_ID> --platform ios` again (reconnect starts a new session) and retry once.

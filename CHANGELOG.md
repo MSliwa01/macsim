@@ -32,8 +32,13 @@ Fixes found by end-to-end runs on a real Mac and by review:
 - An interrupted Expo prebuild no longer loses the previous `ios/` and its Pods.
 - The simulator window is opened only when macsim boots the simulator, not on every command.
 
+- Parallel `ios-device` calls (several agents) no longer break each other: connecting and opening the SSH tunnel to the proxy are serialized, so there is one tunnel, tracked by its pid file, and one connection.
+- Sessions left behind by crashed agents held the simulator forever (`DEVICE_IN_USE`): `macserver restart` restarted only the proxy, never its daemon. It now restarts the daemon and the XCUITest runner too, and `macsim restart` does it from the client.
+- `ios-device` renews an expired proxy lease by itself ("Lease is not active" after a few idle minutes): `open` is retried, other commands say to `open` again.
+
 New:
 
+- `macsim restart` restarts the Mac's agent-device proxy, daemon and runner.
 - `macsim log [build|deps|pods|prebuild|xcodegen]` prints the full Mac-side log of the project in the current directory.
 - `macsim clean --caches` empties npm/CocoaPods/SwiftPM/yarn/pnpm/bun download caches on the Mac; `macsim status` warns under 10 GB free.
 - Builds are serialized on the Mac (`lockf`), so parallel agents don't make a small Mac swap.

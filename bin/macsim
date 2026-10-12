@@ -77,6 +77,7 @@ Housekeeping
   macsim clean NAME|--stale DAYS|--derived|--caches|--all
   macsim ssh [CMD...]                 shell on the Mac (macsim env loaded)
   macsim push                         update Mac-side scripts (automatic on change)
+  macsim restart                      restart the Mac's agent-device proxy + daemon (stuck sessions, DEVICE_IN_USE)
 EOF
 }
 
@@ -134,14 +135,17 @@ PROXY_PID="$CACHE_DIR/proxy-tunnel.pid"
 proxy_url() {
   if [ "$PROXY_MODE" = direct ]; then echo "http://$MAC_HOST:$PROXY_PORT"; return; fi
   local url="http://127.0.0.1:$PROXY_PORT"
+  curl -fs -m 2 -o /dev/null "$url/health" && { echo "$url"; return; }
+  # Agents run several ios-device commands at once: let one of them open the tunnel (and own the
+  # pid file); the others wait here and then find it up.
+  command -v flock >/dev/null && { exec 7>"$CACHE_DIR/proxy-tunnel.lock"; flock 7; }
   if ! curl -fs -m 2 -o /dev/null "$url/health"; then
     pid_alive "$PROXY_PID" && kill "$(cat "$PROXY_PID")" 2>/dev/null
     nohup ssh "${TUN_OPTS[@]}" -L "127.0.0.1:$PROXY_PORT:127.0.0.1:$PROXY_PORT" "$MAC_SSH" \
-      >"$CACHE_DIR/proxy-tunnel.log" 2>&1 &
+      >"$CACHE_DIR/proxy-tunnel.log" 2>&1 7>&- &   # the tunnel must not keep the lock
     echo $! >"$PROXY_PID"
     local _; for _ in 1 2 3 4 5 6 7 8 9 10; do curl -fs -m 1 -o /dev/null "$url/health" && { echo "$url"; return; }; sleep 0.5; done
-    # A parallel caller (agents often run several ios-device commands at once) may own the
-    # tunnel while ours lost the port race, so only fail when the proxy is really unreachable.
+    # Something else may hold the port (e.g. a macsim without flock): only fail when the proxy is unreachable.
     curl -fs -m 2 -o /dev/null "$url/health" && { echo "$url"; return; }
     if ! pid_alive "$PROXY_PID"; then
       ssh "${SSH_OPTS[@]}" "$MAC_SSH" true 2>/dev/null || offline
@@ -528,6 +532,11 @@ main() {
     shutdown) need_config; r shutdown ;;
     devices) need_config; r devices ;;
     list) need_config; r list ;;
+    restart) need_config; r restart-proxy || exit $?
+      # wait until the proxy answers again, so the next ios-device call doesn't fail
+      local _ url; for _ in $(seq 30); do url="$(proxy_url 2>/dev/null)" && curl -fs -m 2 -o /dev/null "$url/health" && break; sleep 1; done
+      rm -f "$CONF_DIR"/agent-device-state/remote-connections/*.json
+      echo "proxy is back; run 'ios-device open <bundle-id> --platform ios' again" ;;
     log) need_config
       case "${1:-}" in build|deps|pods|prebuild|xcodegen) local k="$1"; shift ;; *) local k=build ;; esac
       local root; root="$(proj_root "${1:-}")" || exit 1; r log "$(proj_name "$root")" "$k" ;;

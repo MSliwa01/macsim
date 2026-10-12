@@ -3,7 +3,8 @@
 #   macserver on      keep awake even with the lid closed (plug in the charger!)
 #   macserver off     normal sleep behaviour
 #   macserver status  sleep state, proxy, simulators, disk
-#   macserver restart restart the agent-device proxy
+#   macserver restart restart the agent-device proxy, its daemon and the XCUITest runner
+#                     (clears sessions left behind by agents that never closed them)
 set -u
 LABEL=com.macsim.proxy
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -18,7 +19,11 @@ case "${1:-status}" in
   off)
     sudo pmset -a disablesleep 0 && echo "sleep enabled again" ;;
   restart)
-    launchctl kickstart -k "$dom/$LABEL" && echo "proxy restarted" ;;
+    # The proxy reuses a running daemon, and the daemon keeps its sessions (idle timeout is off),
+    # so a session whose client is gone holds the simulator until the daemon itself restarts.
+    pkill -f "$HOME/.macsim/tools/node_modules/agent-device/dist/src/internal/daemon.js" 2>/dev/null
+    pkill -f 'AgentDeviceRunnerUITests' 2>/dev/null
+    proxy_up; launchctl kickstart -k "$dom/$LABEL" && echo "proxy, daemon and runner restarted" ;;
   status)
     echo "sleep disabled: $(pmset -g | awk '/SleepDisabled/{v=$2} END{print v+0}')"
     if launchctl print "$dom/$LABEL" 2>/dev/null | grep -q 'state = running'; then echo "proxy: running"; else echo "proxy: NOT running (see ~/.macsim/logs/proxy.log)"; fi

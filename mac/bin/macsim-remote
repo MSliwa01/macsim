@@ -586,6 +586,7 @@ main() {
     prepare)     local d; d="$(proj_dir "${1:-}")"; mkdir -p "$d/src" && touch "$d/.last-used" && echo "$d/src" ;;
     artifacts-dir) mkdir -p "$BUILDS/_artifacts" && echo "$BUILDS/_artifacts" ;;
     proxy-host)  proxy_host ;;
+    restart-proxy) "$MACSIM_HOME/bin/macserver" restart ;;
     agent-device-version) agent-device --version ;;
     uninstall)   cmd_uninstall "$@" ;;
     *) die "unknown command: $c" ;;

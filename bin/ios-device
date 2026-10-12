@@ -20,21 +20,37 @@ esac
 
 url="$(macsim _proxy-url)" || exit $?
 marker="$AGENT_DEVICE_STATE_DIR/.macsim-url"
-if [ "${1:-}" = reconnect ] || [ ! -d "$AGENT_DEVICE_STATE_DIR/remote-connections" ] || [ "$(cat "$marker" 2>/dev/null)" != "$url" ]; then
+conns="$AGENT_DEVICE_STATE_DIR/remote-connections"
+needs_connect() { ! ls "$conns"/*.json >/dev/null 2>&1 || [ "$(cat "$marker" 2>/dev/null)" != "$url" ]; }
+
+# connect [force]: (re)create the proxy connection when needed.
+connect() {
+  local seen; seen="$(ls "$conns"/*.json 2>/dev/null)"
   mkdir -p "$AGENT_DEVICE_STATE_DIR"
-  # Release the old connection's lease first. Otherwise its session keeps the simulator, and the
-  # new connection can neither close it nor `open` (DEVICE_IN_USE).
-  if [ -d "$AGENT_DEVICE_STATE_DIR/remote-connections" ]; then
-    if command -v timeout >/dev/null; then timeout 8 agent-device disconnect >/dev/null 2>&1
-    else agent-device disconnect >/dev/null 2>&1; fi
-    # disconnect leaves the connection file behind; without this one piles up per reconnect.
-    rm -f "$AGENT_DEVICE_STATE_DIR"/remote-connections/*.json
+  # Agents often run several commands at once; parallel connects overwrite each other's state.
+  # Serialize, then check again: another call may have (re)connected while this one waited.
+  command -v flock >/dev/null && { exec 8>"$AGENT_DEVICE_STATE_DIR/.connect.lock"; flock 8; }
+  if needs_connect || { [ "${1:-}" = force ] && [ "$(ls "$conns"/*.json 2>/dev/null)" = "$seen" ]; }; then
+    # Release the old connection's lease first. Otherwise its session keeps the simulator, and the
+    # new connection can neither close it nor `open` (DEVICE_IN_USE).
+    if ls "$conns"/*.json >/dev/null 2>&1; then
+      if command -v timeout >/dev/null; then timeout 8 agent-device disconnect >/dev/null 2>&1
+      else agent-device disconnect >/dev/null 2>&1; fi
+      # disconnect leaves the connection file behind; without this one piles up per reconnect.
+      rm -f "$conns"/*.json
+    fi
+    # The token comes from the environment, not argv, so other users can't read it in ps.
+    agent-device connect proxy --force --daemon-base-url "$url/agent-device" >/dev/null || { exec 8>&-; return 1; }
+    echo "$url" >"$marker"
   fi
-  # The token comes from the environment, not argv, so other users can't read it in ps.
-  agent-device connect proxy --force --daemon-base-url "$url/agent-device" >/dev/null || exit 1
-  echo "$url" >"$marker"
-  [ "${1:-}" = reconnect ] && { echo "connected to $url (new session: run 'ios-device open <bundle-id> --platform ios')"; exit 0; }
+  exec 8>&-   # don't hand the lock to agent-device below
+}
+
+if [ "${1:-}" = reconnect ]; then
+  connect force || exit 1
+  echo "connected to $url (new session: run 'ios-device open <bundle-id> --platform ios')"; exit 0
 fi
+connect || exit 1
 
 if [ "${1:-}" = open ]; then
   has_target=0
@@ -44,4 +60,18 @@ if [ "${1:-}" = open ]; then
     [ -n "$udid" ] && set -- "$@" --udid "$udid"
   fi
 fi
-exec agent-device "$@"
+
+# Run it with stderr mirrored to a file: leases expire after a few idle minutes, and then every
+# command fails with "Lease is not active" until someone reconnects. Do that here instead of the agent.
+err="$(mktemp)"; trap 'rm -f "$err"' EXIT
+exec 3>&1
+agent-device "$@" 2>&1 1>&3 3>&- | tee "$err" >&2; rc=${PIPESTATUS[0]}
+if [ "$rc" != 0 ] && grep -q 'Lease is not active' "$err"; then
+  connect force || exit "$rc"
+  if [ "${1:-}" = open ]; then
+    echo "ios-device: the proxy connection had expired; reconnected and retrying" >&2
+    agent-device "$@"; exit $?
+  fi
+  echo "ios-device: the proxy connection had expired and was renewed. The old session is gone: run 'ios-device open <bundle-id> --platform ios' again." >&2
+fi
+exit "$rc"

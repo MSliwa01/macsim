@@ -88,6 +88,7 @@ macsim view                       # watch the simulator in your browser
 | `macsim screenshot`, `launch`, `open-url`, `devices`, `boot`, `shutdown` | Take a screenshot, launch an app, open a deep link, and list, boot or shut down simulators. |
 | `ios-device …` | `agent-device`, connected to the Mac's simulator. `ios-device reconnect` re-creates the proxy connection (then `ios-device open` again). |
 | `macsim list` / `macsim clean …` | Shows / prunes per-project caches on the Mac. |
+| `macsim restart` | Restarts the agent-device proxy, daemon and XCUITest runner on the Mac. Clears sessions left behind by agents that never closed them (`DEVICE_IN_USE`). |
 | `macsim log [build\|deps\|pods\|prebuild\|xcodegen]` | Prints the full Mac-side log of the last build of the project in the current directory. |
 | `macsim ssh [CMD]` | Shell on the Mac with the macsim environment. |
 
