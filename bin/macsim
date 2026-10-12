@@ -368,7 +368,7 @@ cmd_screenshot() {
   local out="${1:-$PWD/sim-$(date +%H%M%S).png}"
   mkdir -p "$(dirname "$out")" || exit 1
   # The PNG comes back on stdout: one round trip, nothing left behind on the Mac.
-  r screenshot ${DEVICE:+"$DEVICE"} >"$out.part" && [ -s "$out.part" ] || { rm -f "$out.part"; die "screenshot failed"; }
+  if ! r screenshot ${DEVICE:+"$DEVICE"} >"$out.part" || ! [ -s "$out.part" ]; then rm -f "$out.part"; die "screenshot failed"; fi
   mv "$out.part" "$out" && echo "$out"
 }
 

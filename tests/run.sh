@@ -133,7 +133,10 @@ rfn() { sed -n "/^$1()/,/^}/p" "$R"; }
 # shellcheck disable=SC2034,SC2329  # LOGDIR/SRC/log/die are used by the eval'd functions
 (
   eval "$(rfn summarize_failure)"; eval "$(rfn pods_install)"; eval "$(rfn pods_inputs)"; eval "$(rfn pods_integrated)"; eval "$(rfn pods_stash)"; eval "$(rfn ios_files)"
-  log() { :; }; die() { echo "$*" >&2; exit 1; }
+  # shellcheck disable=SC2317  # called by the sourced helpers
+  log() { :; }
+  # shellcheck disable=SC2317
+  die() { echo "$*" >&2; exit 1; }
   w="$T/podproj"; mkdir -p "$w/ios"; LOGDIR="$w"; SRC="$w"
   printf '/x/src/App/A.swift:3:1: error: boom\n' >"$w/b.log"
   sf="$(SRC=/x/src summarize_failure "$w/b.log" 2>&1)"
