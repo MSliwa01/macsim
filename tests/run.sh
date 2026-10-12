@@ -122,7 +122,7 @@ R="$ROOT/mac/bin/macsim-remote"
 rfn() { sed -n "/^$1()/,/^}/p" "$R"; }
 # shellcheck disable=SC2034,SC2329  # LOGDIR/SRC/log/die are used by the eval'd functions
 (
-  eval "$(rfn summarize_failure)"; eval "$(rfn pods_install)"; eval "$(rfn pods_inputs)"
+  eval "$(rfn summarize_failure)"; eval "$(rfn pods_install)"; eval "$(rfn pods_inputs)"; eval "$(rfn pods_integrated)"; eval "$(rfn pods_stash)"; eval "$(rfn ios_files)"
   log() { :; }; die() { echo "$*" >&2; exit 1; }
   w="$T/podproj"; mkdir -p "$w/ios"; LOGDIR="$w"; SRC="$w"
   printf '/x/src/App/A.swift:3:1: error: boom\n' >"$w/b.log"
@@ -146,6 +146,15 @@ rfn() { sed -n "/^$1()/,/^}/p" "$R"; }
   [ "$h1" != "$(prebuild_output_hash "$w/pb")" ] && echo "ok   prebuild output: a real pbxproj change is noticed" || echo "FAIL prebuild output: a real pbxproj change is noticed"
   rm -rf "$w/ios/App.xcworkspace"; pods_install "$w/ios"
   [ "$(wc -l <"$w/pod-runs")" = 3 ] && echo "ok   pods: missing workspace re-runs pod install" || echo "FAIL pods: missing workspace re-runs pod install"
+  # ios/ checked in without Pods integration: pod install integrates, a resync puts the plain one back
+  mkdir -p "$w/ios/App.xcodeproj"; echo plain >"$w/ios/App.xcodeproj/project.pbxproj"
+  stub pod 'echo run >>../pod-runs; mkdir -p Pods App.xcworkspace; echo L1 >Podfile.lock; cp Podfile.lock Pods/Manifest.lock; echo "baseConfigurationReference = X /* Pods-App.debug.xcconfig */" >App.xcodeproj/project.pbxproj; echo p >PrivacyInfo.xcprivacy'
+  pods_install "$w/ios"; echo plain >"$w/ios/App.xcodeproj/project.pbxproj"; pods_install "$w/ios"
+  [ "$(wc -l <"$w/pod-runs")" = 4 ] && grep -q Pods-App "$w/ios/App.xcodeproj/project.pbxproj" && echo "ok   pods: synced plain pbxproj gets the integrated one back" || echo "FAIL pods: synced plain pbxproj gets the integrated one back"
+  rm "$w/ios/PrivacyInfo.xcprivacy"; pods_install "$w/ios"
+  [ "$(wc -l <"$w/pod-runs")" = 4 ] && [ -f "$w/ios/PrivacyInfo.xcprivacy" ] && echo "ok   pods: files pod install created come back after a sync" || echo "FAIL pods: files pod install created come back after a sync"
+  echo 'plain+new file' >"$w/ios/App.xcodeproj/project.pbxproj"; pods_install "$w/ios"
+  [ "$(wc -l <"$w/pod-runs")" = 5 ] && echo "ok   pods: a changed client pbxproj re-runs pod install" || echo "FAIL pods: a changed client pbxproj re-runs pod install"
 ) >"$T/helpers.log" 2>&1
 pass=$((pass + $(grep -c '^ok' "$T/helpers.log"))); fail=$((fail + $(grep -c '^FAIL' "$T/helpers.log")))
 cat "$T/helpers.log"

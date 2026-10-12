@@ -23,7 +23,7 @@ macsim build --scheme MyApp --configuration Debug --device "<simulator name from
 ```
 
 - Success prints `BUNDLE_ID=...` and `PROJECT=...`.
-- Failure prints only the compiler errors plus the last 30 log lines. Fix the code and rebuild. The full log stays on the Mac: `macsim ssh cat <BUILDS>/<PROJECT>/logs/build.log`.
+- Failure prints only the compiler errors plus the last 30 log lines. Fix the code and rebuild. For the full log run `macsim log` (or `macsim log pods|deps|prebuild|xcodegen`) in the project dir and pipe it through `grep`/`tail` here.
 - Builds are incremental: the Mac keeps the project's deps, Pods and DerivedData between runs, and only changed files are synced (`.gitignore` is respected).
 
 ### Expo / React Native
@@ -67,6 +67,7 @@ ios-device close                                            # always close: rele
 ### Known situations
 
 - **"Open in <App>?" dialog** on the first deep link into a dev client: `ios-device open com.apple.springboard --platform ios`, then `ios-device snapshot -i`, then press the confirm button. The label is localized, so read it from the snapshot. Reopen the app afterwards.
+- **A deep link or `expo-go` opens nothing:** a system alert of another app (e.g. a location prompt) can sit on top and swallow it. `macsim screenshot` to check, dismiss it with `ios-device`, then retry.
 - **App vanishes right after launch:** read the newest crash report with `macsim ssh 'ls -t ~/Library/Logs/DiagnosticReports | head'`. On the iOS 27 runtime, apps without UIScene lifecycle crash at launch (`...NoSceneLifecycleAdoption`), which hits older Expo/RN templates. That is an app issue; report it.
 
 ## Housekeeping (the Mac is shared and often small)
@@ -75,5 +76,6 @@ ios-device close                                            # always close: rele
 - `macsim list` shows cached projects and their size. Only prune or clean when the user asks:
   - `macsim clean --stale 7` removes projects unused for 7 days.
   - `macsim clean --derived` drops build caches but keeps the projects.
+  - `macsim clean --caches` empties npm/CocoaPods/SwiftPM download caches.
   - `macsim clean <PROJECT>` removes one project.
 - Never install or upgrade Xcode, simulator runtimes, CocoaPods, Node or agent-device yourself. Report what `macsim status` says and let the user act.

@@ -88,6 +88,7 @@ macsim view                       # watch the simulator in your browser
 | `macsim screenshot`, `launch`, `open-url`, `devices`, `boot`, `shutdown` | Take a screenshot, launch an app, open a deep link, and list, boot or shut down simulators. |
 | `ios-device …` | `agent-device`, connected to the Mac's simulator. `ios-device reconnect` re-creates the proxy connection (then `ios-device open` again). |
 | `macsim list` / `macsim clean …` | Shows / prunes per-project caches on the Mac. |
+| `macsim log [build\|deps\|pods\|prebuild\|xcodegen]` | Prints the full Mac-side log of the last build of the project in the current directory. |
 | `macsim ssh [CMD]` | Shell on the Mac with the macsim environment. |
 
 On the Mac:
@@ -144,6 +145,8 @@ What to run when space gets tight:
 
 - `macsim list` shows cached projects and their size.
 - `macsim clean --derived` drops all DerivedData; the next build is a full rebuild.
+- `macsim clean --caches` empties the npm, CocoaPods, SwiftPM (and yarn/pnpm/bun) download caches on the Mac, which grow by several GB with Expo/RN builds. The next install downloads again.
+- `macsim status` warns when the Mac has less than 10 GB free.
 - `macsim clean --stale 7` removes projects unused for a week.
 - `macsim clean NAME` removes one project.
 

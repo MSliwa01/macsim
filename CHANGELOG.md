@@ -26,6 +26,18 @@ Fixes found by end-to-end runs on a real Mac and by review:
 - `expo-go` reinstalls Expo Go when the project needs a different SDK.
 - Uninstall no longer drops a `Host` block written directly after macsim's block in `~/.ssh/config`; setup ends the `Host pc` block with a blank line. `clean --stale` also prunes old uploads and Expo Go downloads.
 
+- React Native / Expo with a checked-in `ios/` made without `pod install` (e.g. prebuilt on Linux): every sync put back the plain `project.pbxproj` and deleted what pod install had added (`PrivacyInfo.xcprivacy`), so every second build failed. macsim now remembers pod install's changes and restores them while the client's files are unchanged.
+- `macsim expo-go` could not install current Expo Go releases (the archive holds the bundle contents, and the extracted directory wasn't named `*.app`).
+- Editing or updating `macsim` while it runs no longer crashes the running command at the end.
+- An interrupted Expo prebuild no longer loses the previous `ios/` and its Pods.
+- The simulator window is opened only when macsim boots the simulator, not on every command.
+
+New:
+
+- `macsim log [build|deps|pods|prebuild|xcodegen]` prints the full Mac-side log of the project in the current directory.
+- `macsim clean --caches` empties npm/CocoaPods/SwiftPM/yarn/pnpm/bun download caches on the Mac; `macsim status` warns under 10 GB free.
+- Builds are serialized on the Mac (`lockf`), so parallel agents don't make a small Mac swap.
+
 Faster:
 
 - SSH commands share one multiplexed connection even without a `ControlMaster` entry in `~/.ssh/config` (~0.15 s per remote call); a short keepalive drops it quickly when the Mac sleeps.

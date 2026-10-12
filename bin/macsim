@@ -73,7 +73,8 @@ UI automation for agents
 
 Housekeeping
   macsim list                         projects cached on the Mac (size, last use)
-  macsim clean NAME|--stale DAYS|--derived|--all
+  macsim log [KIND] [PATH]            full Mac-side log of the last build: build|deps|pods|prebuild|xcodegen
+  macsim clean NAME|--stale DAYS|--derived|--caches|--all
   macsim ssh [CMD...]                 shell on the Mac (macsim env loaded)
   macsim push                         update Mac-side scripts (automatic on change)
 EOF
@@ -527,6 +528,9 @@ main() {
     shutdown) need_config; r shutdown ;;
     devices) need_config; r devices ;;
     list) need_config; r list ;;
+    log) need_config
+      case "${1:-}" in build|deps|pods|prebuild|xcodegen) local k="$1"; shift ;; *) local k=build ;; esac
+      local root; root="$(proj_root "${1:-}")" || exit 1; r log "$(proj_name "$root")" "$k" ;;
     clean) need_config; r clean "$@" ;;
     tunnel) need_config
       case "${1:-status}" in
@@ -542,4 +546,4 @@ main() {
     *) usage >&2; exit 1 ;;
   esac
 }
-main "$@"
+main "$@"; exit $?  # same line: bash must not read on if this file is edited while running
