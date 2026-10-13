@@ -1,41 +1,37 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-13)
 
-- `macserver status` shows the size of `~/.macsim/builds`, where new installs keep projects, and of `~/builds` if an older install still has it.
-- `macsim view` tries `wslview` before `xdg-open`, so under WSL the preview opens in the Windows browser.
-- Script messages use plain punctuation instead of em dashes.
+Most of this release comes from end-to-end runs on a real Mac (M1 Air, Xcode 27) with Swift/XcodeGen, Expo CNG and checked-in `ios/` projects, in both proxy modes.
 
-Fixes found by end-to-end runs on a real Mac and by review:
+Fixes:
 
 - Re-running `macsim bootstrap` (or `setup.sh`) on an existing install left the proxy down: launchd hadn't finished unloading the old LaunchAgent, so loading the new one failed with `Bootstrap failed: 5: Input/output error`. Setup now waits for the unload, and fails loudly if the agent still doesn't load.
 - XcodeGen projects that also commit the `.xcodeproj` alternated between passing and failing builds: every sync put the client's project back and `xcodegen --use-cache` kept it. XcodeGen now always regenerates.
+- React Native / Expo with a checked-in `ios/` made without `pod install` (e.g. prebuilt on Linux): every sync put back the plain `project.pbxproj` and deleted what pod install had added (`PrivacyInfo.xcprivacy`), so every second build failed. macsim now remembers pod install's changes and restores them while the client's files are unchanged.
 - Bare React Native / Expo with a checked-in `ios/`: the Pods `*.xcworkspace` (and `Podfile.lock`) made on the Mac was deleted by the next sync. They are now protected, and a missing workspace re-runs `pod install`.
 - `pod install` now also runs when JS dependencies change (new native modules) and no longer runs on every build when the client's `Podfile.lock` is older than the Mac's.
 - Expo CNG: `expo prebuild` re-runs when `app.json`/`app.config.*`, `plugins/` or dependencies change, instead of building a stale `ios/`. Prebuild recreates `ios/` even without `--clean`, so macsim compares the new output with the previous one: unchanged native project → the old `ios/` is kept (17 s instead of ~8 min on an M1 Air); changed → the old Pods are reused so `pod install` only applies the difference (~2 min).
+- An interrupted Expo prebuild no longer loses the previous `ios/` and its Pods.
 - JS deps also reinstall when `patches/`, `.npmrc`, `.yarnrc.yml` or `pnpm-workspace.yaml` change; a missing yarn/pnpm/bun on the Mac gets a clear message.
+- Sessions left behind by crashed agents held the simulator forever (`DEVICE_IN_USE`): `macserver restart` restarted only the proxy, never its daemon. It now restarts the daemon and the XCUITest runner too, and `macsim restart` does it from the client.
 - `ios-device reconnect` released nothing, so the old session kept the simulator and the next `open` failed with `DEVICE_IN_USE`. It now disconnects first and no longer piles up connection files. The token is passed through the environment instead of argv.
+- Parallel `ios-device` calls (several agents) no longer break each other: connecting and opening the SSH tunnel to the proxy are serialized, so there is one tunnel, tracked by its pid file, and one connection.
+- Parallel `ios-device` calls no longer fail when one of them loses the race to open the proxy tunnel. Pid files are checked against the running process, so a reused pid is never killed.
+- `ios-device` renews an expired proxy lease by itself ("Lease is not active" after a few idle minutes): `open` is retried, other commands say to `open` again.
+- `macsim expo-go` could not install current Expo Go releases (the archive holds the bundle contents, and the extracted directory wasn't named `*.app`).
+- `expo-go` reinstalls Expo Go when the project needs a different SDK.
 - `macsim build --device X` (Expo dev client) opened the Metro link on the default simulator instead of X. Release builds no longer try to open the dev client. `--scheme` reached Expo builds only on the client side.
 - `macsim screenshot` returned success when the copy failed and always used whichever simulator was `booted`. It is now one round trip, creates the output directory, and fails properly.
 - `macsim install Foo.app/` (trailing slash) uploaded the bundle's contents instead of the bundle.
 - `--prebuild` on a non-Expo project and an unknown `--type` are rejected before syncing.
 - Commands now exit with 3 (Mac unreachable) where they used to exit 1 (`sync`, `build`, `install`, `view`, `expo-go`, `ios-device`).
-- Parallel `ios-device` calls no longer fail when one of them loses the race to open the proxy tunnel. Pid files are checked against the running process, so a reused pid is never killed.
 - `tunnel start` and `view` wait until the forward really works instead of sleeping 1.5 s, and `tunnel start` reports a port already taken on the Mac.
 - Nested `.gitignore` files are honoured even without one at the project root. `.macsimignore` accepts `!pattern` to sync a gitignored file. `.xcode.env.local` (this machine's node path) is no longer synced.
 - A simulator picked by name reuses a booted one instead of booting a second with the same name. `screenshot`/`terminate` use the selected simulator.
-- `expo-go` reinstalls Expo Go when the project needs a different SDK.
-- Uninstall no longer drops a `Host` block written directly after macsim's block in `~/.ssh/config`; setup ends the `Host pc` block with a blank line. `clean --stale` also prunes old uploads and Expo Go downloads.
-
-- React Native / Expo with a checked-in `ios/` made without `pod install` (e.g. prebuilt on Linux): every sync put back the plain `project.pbxproj` and deleted what pod install had added (`PrivacyInfo.xcprivacy`), so every second build failed. macsim now remembers pod install's changes and restores them while the client's files are unchanged.
-- `macsim expo-go` could not install current Expo Go releases (the archive holds the bundle contents, and the extracted directory wasn't named `*.app`).
-- Editing or updating `macsim` while it runs no longer crashes the running command at the end.
-- An interrupted Expo prebuild no longer loses the previous `ios/` and its Pods.
 - The simulator window is opened only when macsim boots the simulator, not on every command.
-
-- Parallel `ios-device` calls (several agents) no longer break each other: connecting and opening the SSH tunnel to the proxy are serialized, so there is one tunnel, tracked by its pid file, and one connection.
-- Sessions left behind by crashed agents held the simulator forever (`DEVICE_IN_USE`): `macserver restart` restarted only the proxy, never its daemon. It now restarts the daemon and the XCUITest runner too, and `macsim restart` does it from the client.
-- `ios-device` renews an expired proxy lease by itself ("Lease is not active" after a few idle minutes): `open` is retried, other commands say to `open` again.
+- Editing or updating `macsim` while it runs no longer crashes the running command at the end.
+- Uninstall no longer drops a `Host` block written directly after macsim's block in `~/.ssh/config`; setup ends the `Host pc` block with a blank line. `clean --stale` also prunes old uploads and Expo Go downloads.
 
 New:
 
@@ -43,13 +39,19 @@ New:
 - `macsim log [build|deps|pods|prebuild|xcodegen]` prints the full Mac-side log of the project in the current directory.
 - `macsim clean --caches` empties npm/CocoaPods/SwiftPM/yarn/pnpm/bun download caches on the Mac; `macsim status` warns under 10 GB free.
 - Builds are serialized on the Mac (`lockf`), so parallel agents don't make a small Mac swap.
+- `xcodebuild` gets `-skipMacroValidation -skipPackagePluginValidation` (SwiftPM macros and plugins fail headless otherwise) and `-hideShellScriptEnvironment`.
+- Build errors show project-relative paths (`App/View.swift:12:5: error: …`) that match your checkout.
+- `macserver status` shows the size of `~/.macsim/builds`, where new installs keep projects, and of `~/builds` if an older install still has it.
+- `macsim view` tries `wslview` before `xdg-open`, so under WSL the preview opens in the Windows browser.
 
 Faster:
 
 - SSH commands share one multiplexed connection even without a `ControlMaster` entry in `~/.ssh/config` (~0.15 s per remote call); a short keepalive drops it quickly when the Mac sleeps.
 - A no-change rebuild of a small Swift app went from ~8.3 s to ~2.7 s: the scheme is cached (or read from the shared scheme) instead of `xcodebuild -list`, and an unchanged app is not reinstalled.
-- `xcodebuild` gets `-skipMacroValidation -skipPackagePluginValidation` (SwiftPM macros and plugins fail headless otherwise) and `-hideShellScriptEnvironment`.
-- Build errors show project-relative paths (`App/View.swift:12:5: error: …`) that match your checkout.
+
+Other:
+
+- Script messages use plain punctuation instead of em dashes.
 
 ## 0.1.0 (2026-10-06)
 

@@ -24,7 +24,7 @@ browser ◀───────── serve-sim over SSH ─────── 
 - Ships an [agent skill](skill/mac-ios/SKILL.md) for Claude Code, Codex and other tools that read `SKILL.md`. On a failed build, macsim prints up to 40 deduplicated error lines and the last 30 lines of the log, not the whole log.
 - Fits a small Mac: incremental builds, `.gitignore`-aware sync, one booted simulator, and commands to prune caches.
 
-> Status: early (v0.1). Used daily on one setup (see [Tested on](#tested-on)). Issues and PRs are welcome.
+> Status: early (v0.2). Used daily on one setup (see [Tested on](#tested-on)). Issues and PRs are welcome.
 
 ## Requirements
 
@@ -212,6 +212,7 @@ Your public key stays in the Mac's `~/.ssh/authorized_keys`. Remove it by hand i
 - **Mac.** MacBook Air M1, 8 GB, macOS 27.0.1, Xcode 27.0, iOS 27 runtime.
 - **Client.** Ubuntu-based Linux, bash 5.2, agent-device 0.20.10.
 - **Network.** I use the Tailscale (`--direct`) proxy mode daily. I verified the SSH-tunnel mode (the default for new installs) end to end by hand.
+- **Not tested yet.** Intel Macs, Xcode older than 27, WSL as the client, React Native without Expo. Reports welcome.
 
 ## Development
 
