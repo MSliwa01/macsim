@@ -26,6 +26,10 @@ browser ◀───────── serve-sim over SSH ─────── 
 
 > Status: early (v0.2). Used daily on one setup (see [Tested on](#tested-on)). Issues and PRs are welcome.
 
+## Why
+
+I built macsim because coding agents work better on Linux than on macOS. macOS asks for permission far more often, and Linux uses fewer resources. I didn't want to move my whole workflow to a Mac just for iOS. With macsim the Mac only does what Apple requires a Mac for, which is compiling the app and running the Simulator. Everything else stays on Linux.
+
 ## Requirements
 
 | | Mac | Your machine |
@@ -49,7 +53,7 @@ git clone https://github.com/MSliwa01/macsim && cd macsim
 ./install.sh --skill              # links macsim + ios-device into ~/.local/bin, installs the agent skill
 npm i -g agent-device             # UI automation client (the Mac gets the same version)
 
-# 2. Connect the Mac. This is interactive: it asks for the Mac password once, may ask for sudo,
+# 2. Connect the Mac. It is interactive. It asks for the Mac password once, may ask for sudo,
 #    offers to install missing tools on the Mac, and asks whether the Mac may SSH back.
 macsim bootstrap <mac-user>@<mac-host>
 
@@ -71,7 +75,7 @@ macsim view                       # watch the simulator in your browser
 | Flag | Effect |
 |---|---|
 | `--direct` | Bind the proxy to the Mac's Tailscale address and reach it at `http://<mac-host>:4310` instead of through an SSH tunnel. For another interface, set `PROXY_BIND=<ip>` in `~/.macsim/config` on the Mac. By default the proxy stays on `127.0.0.1` and is reached through SSH. |
-| `--pc-access` | Let the Mac SSH back into your machine. Adds a `pc` command on the Mac that attaches to a tmux session where your agents run. Useful when you're on the laptop and the agents live on the desktop. |
+| `--pc-access` | Let the Mac SSH back into your machine. Adds a `pc` command on the Mac that attaches to a tmux session where your agents run. This helps when you work on the laptop and the agents run on the desktop. |
 | `--alias NAME` | Use a different SSH alias. |
 
 ## Everyday use
@@ -122,13 +126,13 @@ Install the skill with `./install.sh --skill`. It links `skill/mac-ios` into `~/
 - handle the known iOS dialogs and crashes;
 - be careful with the Mac's disk and RAM.
 
-`ios-device open` without `--device`/`--udid` always targets the macsim simulator, so an agent never grabs a physical iPhone that is paired with the Mac.
+`ios-device open` without `--device`/`--udid` always targets the macsim simulator, so an agent never picks a physical iPhone that is paired with the Mac.
 
 ## How it works
 
-- **Sync.** Each project gets `~/.macsim/builds/<name>-<hash>/{src,dd,logs}` on the Mac. `rsync --delete` skips `.git`, `node_modules`, `Pods`, build output, anything in your `.gitignore` files, and anything in an optional `.macsimignore`. Files generated on the Mac (`ios/` from Expo prebuild, `*.xcodeproj` from XcodeGen, `node_modules`, `Pods`, and the Pods `*.xcworkspace` / `Podfile.lock` when your checkout has none) are protected from deletion, so builds stay incremental.
+- **Sync.** Each project gets `~/.macsim/builds/<name>-<hash>/{src,dd,logs}` on the Mac. `rsync --delete` skips `.git`, `node_modules`, `Pods`, build output, anything in your `.gitignore` files, and anything in an optional `.macsimignore`. Files generated on the Mac (`ios/` from Expo prebuild, `*.xcodeproj` from XcodeGen, `node_modules`, `Pods`, and the Pods `*.xcworkspace` / `Podfile.lock` when your checkout has none) are excluded from `--delete`, so builds stay incremental.
 - **`.macsimignore`.** One pattern per line (rsync syntax, `#` comments). A `!pattern` line syncs something your `.gitignore` excludes, e.g. `!GoogleService-Info.plist`; for a file inside an ignored directory, also add that directory (`!secrets/`). rsync doesn't understand gitignore's own `!` negations, so files kept that way also need a `!` line here.
-- **Build.** macsim reinstalls JS deps only when the lockfile, `package.json`, `patches/` or the package manager config changes, and Pods only when the Podfile, its lockfile or the JS deps change. For Expo CNG projects it re-runs `expo prebuild` when `app.json`/`app.config.*`, `plugins/` or the deps change; if the generated native project comes out the same, the existing `ios/` (with its Pods) is kept, so such a rebuild takes seconds instead of minutes. XcodeGen regenerates the project on every build (well under a second). Then `xcodebuild` builds for the simulator, and `simctl` installs the app unless the same build is already installed.
+- **Build.** macsim reinstalls JS deps only when the lockfile, `package.json`, `patches/` or the package manager config changes, and Pods only when the Podfile, its lockfile or the JS deps change. For Expo CNG projects it re-runs `expo prebuild` when `app.json`/`app.config.*`, `plugins/` or the deps change. If the generated native project comes out the same, macsim keeps the existing `ios/` with its Pods, and the rebuild takes seconds instead of minutes. XcodeGen regenerates the project on every build (well under a second). Then `xcodebuild` builds for the simulator, and `simctl` installs the app unless the same build is already installed.
 - **UI automation.** A LaunchAgent on the Mac runs `agent-device proxy`, protected by a random token. `ios-device` connects to it through an SSH tunnel (default) or directly (`--direct`), using its own agent-device state dir so a local `agent-device` keeps working.
 - **Updates.** The client hashes `mac/` and re-uploads the Mac-side scripts automatically when they change. After `git pull` there's nothing to do on the Mac.
 
@@ -155,7 +159,7 @@ macsim never deletes anything unless you ask.
 
 ## Security
 
-- **Proxy.** By default the agent-device proxy listens only on `127.0.0.1` on the Mac and is reached through your SSH connection. With `--direct` it binds to the Mac's Tailscale address (`PROXY_BIND=tailscale`) or any address you set. All proxy requests need a random 32-byte token, stored in `~/.config/macsim/token` (client) and `~/.macsim/token` (Mac), mode 600. Anyone with the token and network access to the proxy can control the simulator.
+- **Proxy.** By default the agent-device proxy listens only on `127.0.0.1` on the Mac, and `ios-device` reaches it through your SSH connection. With `--direct` it binds to the Mac's Tailscale address (`PROXY_BIND=tailscale`) or any address you set. All proxy requests need a random 32-byte token, stored in `~/.config/macsim/token` (client) and `~/.macsim/token` (Mac), mode 600. Anyone with the token and network access to the proxy can control the simulator.
 - **SSH.** macsim uses your normal SSH key auth with `BatchMode`, so it never stores passwords. The `Host macsim-mac` block turns on SSH connection sharing (`ControlMaster auto`, `ControlPersist 10m`). Commands reuse one connection, and it stays open for 10 minutes after the last command ends. The sockets live in `~/.ssh/cm/`. The tunnels open their own connections.
 - **Metro tunnel.** `macsim tunnel` opens a reverse SSH forward that binds `127.0.0.1:8081` (or your `--metro-port`) on the Mac, so only processes on the Mac can reach Metro through it.
 - **Mac access to your machine.** `--pc-access`, or answering yes to the same question during `bootstrap`, gives the Mac's key a full shell on your machine. Enable it only for a Mac you trust. `macsim uninstall` removes that key from `~/.ssh/authorized_keys` only if macsim created it.
@@ -203,7 +207,7 @@ Your public key stays in the Mac's `~/.ssh/authorized_keys`. Remove it by hand i
 ## Limitations
 
 - **Simulator only.** Physical devices, SwiftUI Previews, Instruments and the Xcode debugger UI need the Mac itself.
-- **Monorepos.** The directory you build is what gets synced, so hoisted `node_modules` above it isn't.
+- **Monorepos.** macsim syncs only the directory you build, so it skips a hoisted `node_modules` above it.
 - **SwiftPM-only packages.** A package without an app project can't be launched.
 - **Not yet tried on a real setup.** `macsim expo-go` and bare React Native (non-Expo) builds.
 
