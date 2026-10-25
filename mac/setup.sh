@@ -95,7 +95,13 @@ if command -v brew >/dev/null && ! "$(brew --prefix)/bin/rsync" --version >/dev/
   ask "Install a modern rsync (faster and more compatible than macOS openrsync)?" && brew install rsync
 fi
 
+if command -v brew >/dev/null && ! command -v simslim >/dev/null; then
+  ask "Install simslim (turns off simulator daemons apps don't need, about half the RAM per simulator)?" \
+    && brew install mobai-app/tap/simslim
+fi
+
 step "Config (~/.macsim/config)"
+OLD_CONFIG="$(cat "$MACSIM_HOME/config" 2>/dev/null)"
 cat >"$MACSIM_HOME/config" <<EOF
 # macsim config (Mac side). Re-running setup.sh keeps these values.
 PROXY_PORT=$PORT
@@ -109,7 +115,19 @@ SERVE_SIM_VERSION=$SERVE_SIM_VERSION
 SIM_GUI=${SIM_GUI:-1}
 # simulator used when none is given (empty = booted one, else newest plain iPhone)
 DEFAULT_DEVICE="${DEFAULT_DEVICE:-}"
+# 1 = slim simulators with simslim when macsim boots them (if simslim is installed)
+SLIM=${SLIM:-1}
+# simslim categories to keep running, comma-separated (simslim profiles lists them)
+SLIM_EXCEPT="${SLIM_EXCEPT-photos}"
 EOF
+# Keep lines added by hand (e.g. AGENT_DEVICE_IOS_TEAM_ID exports); the settings above replace their old values.
+if [ -n "$OLD_CONFIG" ]; then
+  printf '%s\n' "$OLD_CONFIG" | grep -vxF -f "$MACSIM_HOME/config" \
+    | grep -vE '^(PROXY_PORT|PROXY_BIND|BUILDS|AGENT_DEVICE_VERSION|SERVE_SIM_VERSION|SIM_GUI|DEFAULT_DEVICE|SLIM|SLIM_EXCEPT)=' \
+    | grep -vE '^# (macsim config|where the agent-device proxy|per-project working|1 = show|simulator used when|1 = slim|simslim categories)' \
+    >"$MACSIM_HOME/config.extra"
+  cat "$MACSIM_HOME/config.extra" >>"$MACSIM_HOME/config"; rm -f "$MACSIM_HOME/config.extra"
+fi
 grep -v '^#' "$MACSIM_HOME/config"
 if [ -s "$MACSIM_HOME/token" ]; then chmod 600 "$MACSIM_HOME/token"
 else echo "WARNING: $MACSIM_HOME/token missing (macsim bootstrap copies it)"; fi

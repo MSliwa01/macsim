@@ -60,6 +60,8 @@ Build & run (inside the project dir, or pass PATH)
   macsim devices                      list available iPhone simulators
   macsim boot [NAME]                  boot a simulator (prints its UDID)
   macsim shutdown                     shut down all simulators (frees Mac RAM)
+  macsim slim [CMD] [ARGS]            simslim on the simulator: status, measure, enable/disable CATEGORY,
+                                      doctor --requires FEATURES, off, profiles (needs simslim on the Mac)
   macsim view [stop]                  live simulator in your browser (serve-sim over SSH)
 
 React Native / Expo (Metro runs on this machine)
@@ -530,6 +532,7 @@ main() {
     screenshot) need_config; cmd_screenshot "$@" ;;
     boot) need_config; r boot "${1:-$DEVICE}" ;;
     shutdown) need_config; r shutdown ;;
+    slim) need_config; r slim "$@" ;;
     devices) need_config; r devices ;;
     list) need_config; r list ;;
     restart) need_config; r restart-proxy || exit $?

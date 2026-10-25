@@ -68,11 +68,13 @@ ios-device close                                            # always close: rele
 
 - **"Open in <App>?" dialog** on the first deep link into a dev client: `ios-device open com.apple.springboard --platform ios`, then `ios-device snapshot -i`, then press the confirm button. The label is localized, so read it from the snapshot. Reopen the app afterwards.
 - **A deep link or `expo-go` opens nothing:** a system alert of another app (e.g. a location prompt) can sit on top and swallow it. `macsim screenshot` to check, dismiss it with `ios-device`, then retry.
+- **Push, universal links, StoreKit, iCloud or Sign in with Apple silently do nothing:** the simulator may be slimmed. When simslim is installed, macsim turns off about 160 background daemons on boot (it keeps Photos). Run `macsim slim doctor --requires push,universal-links,storekit` to check. `macsim slim enable store` (or `web`, `icloud`; `macsim slim profiles` lists the categories) turns one back on until the next reboot. To keep it on for good, the user adds it to `SLIM_EXCEPT` in the Mac's `~/.macsim/config`.
 - **App vanishes right after launch:** read the newest crash report with `macsim ssh 'ls -t ~/Library/Logs/DiagnosticReports | head'`. On the iOS 27 runtime, apps without UIScene lifecycle crash at launch (`...NoSceneLifecycleAdoption`), which hits older Expo/RN templates. That is an app issue; report it.
 
 ## Housekeeping (the Mac is shared and often small)
 
 - Keep one simulator booted. When the UI work is done for a while, run `macsim shutdown`.
+- `macsim slim measure` shows the booted simulator's memory (about 0.8 GB slim, 1.7 GB stock on iOS 27).
 - `macsim list` shows cached projects and their size. Only prune or clean when the user asks:
   - `macsim clean --stale 7` removes projects unused for 7 days.
   - `macsim clean --derived` drops build caches but keeps the projects.

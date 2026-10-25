@@ -10,6 +10,7 @@ BUILDS="" PROXY_BIND="" PROXY_PORT=4310
 # shellcheck disable=SC1091
 [ -f "$MACSIM_HOME/config" ] && . "$MACSIM_HOME/config"
 SIM_GUI="${SIM_GUI:-1}"
+SLIM="${SLIM:-1}" SLIM_EXCEPT="${SLIM_EXCEPT-photos}"
 # Per-project working copies. Installs from before BUILDS was configurable used ~/builds.
 if [ -z "$BUILDS" ]; then
   if ls "$HOME"/builds/*/.last-used >/dev/null 2>&1; then BUILDS="$HOME/builds"; else BUILDS="$MACSIM_HOME/builds"; fi
@@ -56,6 +57,19 @@ json_devices() {
     });'
 }
 
+# Turn off simulator daemons an app test doesn't need (simslim, optional): about 1.7 GB -> 0.8 GB
+# per iOS 27 simulator. The disable overrides persist per device, so after the first time this is a
+# sub-second check. A device that drifted (new, erased) is slimmed live, without a reboot.
+slim_device() {
+  [ "$SLIM" = 1 ] && command -v simslim >/dev/null || return 0
+  # shellcheck disable=SC2086  # an empty SLIM_EXCEPT must expand to nothing
+  simslim verify "$1" ${SLIM_EXCEPT:+--except "$SLIM_EXCEPT"} >/dev/null 2>&1 && return 0
+  log "slimming simulator $1 (simslim, keeps: ${SLIM_EXCEPT:-nothing})"
+  # shellcheck disable=SC2086
+  simslim on "$1" --no-reboot ${SLIM_EXCEPT:+--except "$SLIM_EXCEPT"} >&2 \
+    || log "simslim failed, the simulator runs stock (SLIM=0 in ~/.macsim/config turns this off)"
+}
+
 # resolve_device [name|udid] -> prints udid of a booted simulator
 resolve_device() {
   local want="${1:-${DEFAULT_DEVICE:-}}" rows udid="" state=""
@@ -80,6 +94,7 @@ resolve_device() {
     log "booting simulator $udid"
     xcrun simctl boot "$udid" >/dev/null 2>&1 || true
     xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true
+    slim_device "$udid"
     # Show the window only when we boot: reopening it on every command costs time and RAM on a
     # small Mac, and brings back a window the user closed. Xcode 27 replaced Simulator.app with DeviceHub.app.
     if [ "$SIM_GUI" = "1" ]; then
@@ -534,6 +549,24 @@ cmd_list() {
   done
 }
 
+# macsim slim [simslim command] [args]: simslim on the booted (or default) simulator.
+cmd_slim() {
+  command -v simslim >/dev/null || die "simslim is not installed on the Mac: brew install mobai-app/tap/simslim"
+  local sub="${1:-status}" u; [ $# -gt 0 ] && shift
+  case "$sub" in
+    list|profiles|version|--version|help|-h|--help) simslim "$sub" "$@"; return ;;
+    doctor) [ "${1:-}" = --list ] && { simslim doctor "$@"; return; } ;;
+    top) die "top is interactive: macsim ssh, then simslim top" ;;
+  esac
+  u="$(resolve_device "")" || exit 1
+  simslim "$sub" "$u" "$@" || return
+  case "$sub" in
+    off) [ "$SLIM" = 1 ] && echo "note: the next macsim boot slims it again. To keep it stock, set SLIM=0 in ~/.macsim/config" ;;
+    enable) echo "note: lasts until the simulator reboots. To keep it, add the category to SLIM_EXCEPT in ~/.macsim/config" ;;
+  esac
+  return 0
+}
+
 cmd_doctor() {
   local ok=1
   chk() { if eval "$2" >/dev/null 2>&1; then printf '  ok   %s\n' "$1"; else printf '  FAIL %s  -> %s\n' "$1" "$3"; ok=0; fi; }
@@ -558,6 +591,9 @@ cmd_doctor() {
     && echo "  WARN under 10 GB free: macsim list, then macsim clean --stale 7 / --derived / --caches"
   echo "  sleep disabled: $(pmset -g 2>/dev/null | awk '/SleepDisabled/{v=$2} END{print v+0}')"
   echo "  booted: $(xcrun simctl list devices booted 2>/dev/null | grep -c Booted) simulator(s)"
+  if ! command -v simslim >/dev/null; then echo "  simslim: not installed (optional, halves simulator RAM: brew install mobai-app/tap/simslim)"
+  elif [ "$SLIM" = 1 ]; then echo "  simslim $(simslim --version 2>/dev/null | awk '{print $2}'): slims simulators on boot, keeps: ${SLIM_EXCEPT:-nothing}"
+  else echo "  simslim: installed, off (SLIM=0)"; fi
   [ "$ok" = 1 ]
 }
 
@@ -568,7 +604,7 @@ main() {
     build-expo)  cmd_build_expo "$@" ;;
     install)     cmd_install "$@" ;;
     expo-go)     cmd_expo_go "$@" ;;
-    boot)        resolve_device "${1:-}" ;;
+    boot)        local u; u="$(resolve_device "${1:-}")" && slim_device "$u" && echo "$u" ;;
     devices)     cmd_devices ;;
     view)        cmd_view "$@" ;;
     launch)      local u; u="$(resolve_device "${2:-}")" && xcrun simctl launch --terminate-running-process "$u" "$1" ;;
@@ -583,6 +619,7 @@ main() {
                  [ -f "$f" ] || die "no $k log for $1 yet"; cat "$f" ;;
     touch)       touch_used "$(proj_dir "$1")" ;;
     doctor)      cmd_doctor ;;
+    slim)        cmd_slim "$@" ;;
     prepare)     local d; d="$(proj_dir "${1:-}")"; mkdir -p "$d/src" && touch "$d/.last-used" && echo "$d/src" ;;
     artifacts-dir) mkdir -p "$BUILDS/_artifacts" && echo "$BUILDS/_artifacts" ;;
     proxy-host)  proxy_host ;;

@@ -90,6 +90,7 @@ macsim view                       # watch the simulator in your browser
 | `macsim install FILE --launch` | Installs a simulator `.app` / `.tar.gz` / `.zip`, e.g. an EAS simulator build. |
 | `macsim view` | Opens the live simulator in your browser via [serve-sim](https://github.com/EvanBacon/serve-sim) on `localhost:3200`. `macsim view stop` stops it. |
 | `macsim screenshot`, `launch`, `open-url`, `devices`, `boot`, `shutdown` | Take a screenshot, launch an app, open a deep link, and list, boot or shut down simulators. |
+| `macsim slim [CMD]` | Runs [simslim](https://github.com/MobAI-App/simslim) on the simulator: `status`, `measure`, `enable`/`disable CATEGORY`, `doctor --requires FEATURES`, `off`. See [Simulator memory](#simulator-memory). |
 | `ios-device …` | `agent-device`, connected to the Mac's simulator. `ios-device reconnect` re-creates the proxy connection (then `ios-device open` again). |
 | `macsim list` / `macsim clean …` | Shows / prunes per-project caches on the Mac. |
 | `macsim restart` | Restarts the agent-device proxy, daemon and XCUITest runner on the Mac. Clears sessions left behind by agents that never closed them (`DEVICE_IN_USE`). |
@@ -156,6 +157,19 @@ What to run when space gets tight:
 - `macsim clean NAME` removes one project.
 
 macsim never deletes anything unless you ask.
+
+## Simulator memory
+
+A stock iOS 27 simulator runs about 180 processes and uses 1.7 GB, which is a lot on an 8 GB Mac. If [simslim](https://github.com/MobAI-App/simslim) is installed on the Mac (`setup.sh` offers it, or `brew install mobai-app/tap/simslim`), macsim turns off the background daemons an app test doesn't need whenever it boots a simulator: Siri, Spotlight, widgets, iCloud, App Store, push and so on. On an 8 GB MacBook Air M1 the simulator dropped to 78 processes and 0.8 GB. simslim stores the change per simulator, so the first boot takes about 20 s longer and later boots check it in under a second.
+
+Remote push, universal links, StoreKit, iCloud and the other services in `macsim slim profiles` stop working. Photos stays on so the photo picker and `simctl addmedia` work. Two settings in the Mac's `~/.macsim/config` change this:
+
+```bash
+SLIM=0                         # leave simulators stock
+SLIM_EXCEPT="photos,store,web" # categories to keep running
+```
+
+For a one-off, `macsim slim enable store` turns a category back on until the next reboot, and `macsim slim off` puts the simulator back to stock (the next `macsim boot` slims it again unless `SLIM=0`).
 
 ## Security
 
@@ -230,7 +244,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Credits
 
-Built on [agent-device](https://github.com/callstack/agent-device) (Callstack) for UI automation and [serve-sim](https://github.com/EvanBacon/serve-sim) (Evan Bacon) for the live preview.
+Built on [agent-device](https://github.com/callstack/agent-device) (Callstack) for UI automation, [serve-sim](https://github.com/EvanBacon/serve-sim) (Evan Bacon) for the live preview and, optionally, [simslim](https://github.com/MobAI-App/simslim) (MobAI) for slimmer simulators.
 
 ## License
 

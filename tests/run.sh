@@ -224,8 +224,11 @@ check "bootstrap --pc-access: Host pc on the Mac"   grep -q '^Host pc$' "$FAKE_M
 check "bootstrap --pc-access: Mac key authorized"   grep -q 'mac-macsim$' "$HOME/.ssh/authorized_keys"
 # re-running setup keeps user edits to the Mac config
 sed -i 's/^PROXY_BIND=.*/PROXY_BIND=tailscale/' "$mc"
+printf '# my note\nexport MY_VAR=1\n' >>"$mc"
 HOME="$FAKE_MAC" PATH="$FAKE_BIN:$PATH" bash "$FAKE_MAC/.macsim/setup.sh" </dev/null >"$T/setup2.log" 2>&1; rc=$?
 check "setup.sh re-run keeps PROXY_BIND"            grep -q '^PROXY_BIND=tailscale$' "$mc"
+check "setup.sh re-run keeps hand-added lines"      test "$(grep -c '^export MY_VAR=1$\|^# my note$' "$mc")" = 2
+check "setup.sh re-run writes each key once"        test "$(grep -c '^PROXY_BIND=\|^SLIM=' "$mc")" = 2
 check "setup.sh re-run reloads the LaunchAgent"     test "$rc" = 0 -a -n "$(grep 'LaunchAgent loaded' "$T/setup2.log")"
 [ "$fail" = 0 ] || { echo "--- bootstrap log"; tail -20 "$T/bootstrap.log"; }
 

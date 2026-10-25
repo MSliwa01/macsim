@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- When [simslim](https://github.com/MobAI-App/simslim) is installed on the Mac, macsim turns off the simulator daemons app tests don't need whenever it boots one. On an 8 GB M1 Air the iOS 27 simulator went from 1.7 GB and 181 processes to 0.8 GB and 78 processes. Photos stays on. `SLIM` and `SLIM_EXCEPT` in `~/.macsim/config` control it, `setup.sh` offers to install simslim, and `macsim status` reports it.
+- `macsim slim` runs simslim on the simulator (`status`, `measure`, `enable`, `disable`, `doctor`, `off`, `profiles`).
+- Re-running `setup.sh` no longer drops lines added by hand to `~/.macsim/config`, such as `AGENT_DEVICE_IOS_TEAM_ID` exports.
+
 ## 0.2.0 (2026-10-13)
 
 Most of this release comes from end-to-end runs on a real Mac (M1 Air, Xcode 27) with Swift/XcodeGen, Expo CNG and checked-in `ios/` projects, in both proxy modes.
